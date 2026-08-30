@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from backend.api.schemas import AnalysisResponse
 from backend.analysis.project_analyzer import ProjectAnalyzer
 from backend.risk.engine import RiskEngine
@@ -9,7 +10,22 @@ app = FastAPI(
     description="Static code analysis and structural risk detection",
     version="0.1.0",
 )
+app = FastAPI(
+    title="Code Guardian AI",
+    description="Static code analysis and structural risk detection",
+    version="0.1.0",
+)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 def health_check():
