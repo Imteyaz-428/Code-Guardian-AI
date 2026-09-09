@@ -1,25 +1,45 @@
 from backend.analysis.project_analyzer import ProjectAnalyzer
 
 
-repository_path = "tests/sample_project"
+def test_project_analyzer_analyzes_sample_project():
+    repository_path = "tests/sample_project"
 
-analyzer = ProjectAnalyzer(repository_path)
+    analyzer = ProjectAnalyzer(repository_path)
 
-results = analyzer.analyze()
+    results = analyzer.analyze()
 
-print(f"Files analyzed: {len(results)}")
+    assert isinstance(results, list)
+    assert len(results) == 3
+    assert all(result.file_path for result in results)
+    assert any(result.functions for result in results)
+    assert any(result.metrics for result in results)
 
-for result in results:
 
-    print("\n" + "=" * 50)
-    print(f"FILE: {result.file_path}")
+def test_project_analyzer_continues_after_invalid_python(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.repository.manager.settings.ALLOWED_ANALYSIS_ROOT",
+        tmp_path,
+    )
 
-    print(f"Functions: {len(result.functions)}")
+    good_file = tmp_path / "good.py"
+    broken_file = tmp_path / "broken.py"
 
-    for metric in result.metrics:
-        print(
-            f"  {metric.name} -> "
-            f"LOC={metric.lines_of_code}, "
-            f"Complexity={metric.cyclomatic_complexity}, "
-            f"Nesting={metric.nesting_depth}"
-        )
+    good_file.write_text(
+        "def hello():\n    return 'hello'\n",
+        encoding="utf-8",
+    )
+
+    broken_file.write_text(
+        "def broken(:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    analyzer = ProjectAnalyzer(tmp_path)
+
+    results = analyzer.analyze()
+
+    assert len(results) == 1
+    assert results[0].file_path == str(good_file)
+
+    assert len(analyzer.errors) == 1
+    assert "Syntax error" in analyzer.errors[0]

@@ -1,20 +1,32 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
-class SummaryResponse(BaseModel):
-    files_analyzed: int
-    functions_analyzed: int
+class AnalyzeRequest(BaseModel):
+    repository_path: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Path to the repository relative to the configured analysis root."
+        ),
+    )
 
 
-class FindingResponse(BaseModel):
+class Finding(BaseModel):
     file: str
     function: str
     line: int
-    score: float
+    score: int
     level: str
     reasons: list[str]
 
 
+class AnalysisSummary(BaseModel):
+    files_analyzed: int
+    functions_analyzed: int
+    files_failed: int = 0
+
+
 class AnalysisResponse(BaseModel):
-    summary: SummaryResponse
-    findings: list[FindingResponse]
+    summary: AnalysisSummary
+    findings: list[Finding]
+    errors: list[str] = Field(default_factory=list)

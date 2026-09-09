@@ -1,43 +1,38 @@
+from __future__ import annotations
+
 from pathlib import Path
 
-from backend.repository.manager import RepositoryManager
-from backend.parsing.ast_parser import ASTParser, CodeExtractor
 from backend.analysis.metrics import MetricsAnalyzer
 from backend.models.analysis_result import AnalysisResult
+from backend.parsing.ast_parser import ASTParser, CodeExtractor
+from backend.repository.manager import RepositoryManager
 
 
 class ProjectAnalyzer:
+    """Analyze all supported source files in a repository."""
 
     def __init__(self, repository_path: str | Path):
         self.repository_manager = RepositoryManager(repository_path)
+        self.errors: list[str] = []
 
     def analyze(self) -> list[AnalysisResult]:
-        """
-        Analyze every Python file in the repository.
-        """
+        self.errors = []
+        results: list[AnalysisResult] = []
 
-        python_files = self.repository_manager.get_python_files()
+        for file_path in self.repository_manager.get_python_files():
+            try:
+                tree = ASTParser(file_path).parse()
+            except ValueError as exc:
+                self.errors.append(str(exc))
+                continue
 
-        results = []
-
-        for file_path in python_files:
-
-            # Parse source code
-            parser = ASTParser(file_path)
-            tree = parser.parse()
-
-            # Extract structural information
             extractor = CodeExtractor()
             extractor.visit(tree)
-
             result = extractor.get_result(file_path)
 
-            # Calculate function metrics
             metrics_analyzer = MetricsAnalyzer()
             metrics_analyzer.visit(tree)
-
             result.metrics = metrics_analyzer.metrics
-
             results.append(result)
 
         return results

@@ -1,7 +1,7 @@
 from backend.repository.manager import RepositoryManager
 
 
-manager = RepositoryManager("./sample_project")
+manager = RepositoryManager("tests/sample_project")
 
 print("Repository valid:", manager.validate_repository())
 

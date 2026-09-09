@@ -1,16 +1,47 @@
-# React + Vite
+# Code Guardian AI — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite single-page app for Code Guardian AI. Lets you point at a
+repository path, triggers a static risk analysis via the backend API, and
+displays per-function risk scores with details.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- React 19
+- Vite
+- Plain CSS (theme variables in `src/App.css`)
 
-## React Compiler
+## Getting started
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+npm install
+npm run dev
+```
 
-## Expanding the ESLint configuration
+The dev server runs on the default Vite port and expects the backend API to
+be reachable (see below).
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Configuration
+
+The API base URL defaults to `http://127.0.0.1:8000`. Override it by setting
+`VITE_API_URL` in a `.env` file or your environment:
+
+```bash
+VITE_API_URL=https://api.example.com npm run dev
+```
+
+## Scripts
+
+- `npm run dev` — start the dev server with HMR
+- `npm run build` — production build to `dist/`
+- `npm run preview` — preview the production build locally
+- `npm run lint` — run ESLint
+
+## Project structure
+
+```
+src/
+  components/   UI components (form, results table, details panel, etc.)
+  hooks/        useRepositoryAnalysis — owns request/loading/error state
+  services/     api.js — fetch wrapper for the backend /analyze endpoint
+  utils/        risk.js — sorting/formatting helpers for findings
+```
