@@ -9,36 +9,48 @@ function FindingDetails({ finding }) {
 
       {finding ? (
         <div className="details">
-          <h3>{finding.function}()</h3>
+          <div className="finding-heading">
+            <h3>{finding.function}()</h3>
 
-          <p className="file-location">
-            {finding.file}:{finding.line}
-          </p>
+            <p className="file-location">
+              {finding.file}:{finding.line}
+            </p>
+          </div>
 
           <div className="score">
             <span>Risk Score</span>
+
             <strong>
               {finding.score}
               <small>/100</small>
             </strong>
           </div>
 
-          <RiskBadge level={finding.level} size="large" />
+          <RiskBadge
+            level={finding.level}
+            size="large"
+          />
 
-          <h4>Why?</h4>
+          <div className="risk-reasons">
+            <h4>Why?</h4>
 
-          {finding.reasons.length > 0 ? (
-            <ul>
-              {finding.reasons.map((reason, index) => (
-                <li key={index}>{reason}</li>
-              ))}
-            </ul>
-          ) : (
-            <p>No major structural concerns detected.</p>
-          )}
+            {finding.reasons?.length > 0 ? (
+              <ul>
+                {finding.reasons.map((reason, index) => (
+                  <li key={index}>{reason}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="no-reasons">
+                No major structural concerns detected.
+              </p>
+            )}
+          </div>
         </div>
       ) : (
-        <p className="empty">Select a function to see details.</p>
+        <div className="empty">
+          <p>Select a function to see details.</p>
+        </div>
       )}
     </div>
   );

@@ -1,27 +1,51 @@
 import { countByLevel } from "../utils/risk";
 
 function SummaryStats({ summary, findings }) {
+  const stats = [
+    {
+      label: "Files",
+      value: summary.files_analyzed,
+      description: "analyzed",
+    },
+    {
+      label: "Functions",
+      value: summary.functions_analyzed,
+      description: "detected",
+    },
+    {
+      label: "High Risk",
+      value: countByLevel(findings, "HIGH"),
+      description: "findings",
+      emphasis: "high",
+    },
+    {
+      label: "Medium Risk",
+      value: countByLevel(findings, "MEDIUM"),
+      description: "findings",
+      emphasis: "medium",
+    },
+  ];
+
   return (
-    <section className="summary-grid">
-      <div className="summary-card">
-        <span>Files</span>
-        <strong>{summary.files_analyzed}</strong>
-      </div>
+    <section className="summary-grid" aria-label="Analysis summary">
+      {stats.map((stat) => (
+        <article
+          className={`summary-card ${
+            stat.emphasis ? `summary-${stat.emphasis}` : ""
+          }`}
+          key={stat.label}
+        >
+          <div className="summary-card-header">
+            <span>{stat.label}</span>
+          </div>
 
-      <div className="summary-card">
-        <span>Functions</span>
-        <strong>{summary.functions_analyzed}</strong>
-      </div>
+          <div className="summary-card-value">
+            <strong>{stat.value}</strong>
+          </div>
 
-      <div className="summary-card">
-        <span>High Risk</span>
-        <strong>{countByLevel(findings, "HIGH")}</strong>
-      </div>
-
-      <div className="summary-card">
-        <span>Medium Risk</span>
-        <strong>{countByLevel(findings, "MEDIUM")}</strong>
-      </div>
+          <small>{stat.description}</small>
+        </article>
+      ))}
     </section>
   );
 }

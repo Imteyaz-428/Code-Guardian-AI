@@ -1,13 +1,13 @@
-import os
-import utils
-
 from services.user import UserService
+from utils import helper
 
 
 def main():
-    user = UserService()
-    print(user)
+    helper()
+    service = UserService()
+    service.get_user()
+    calculate()
 
 
 def calculate():
-    return 10 + 20
+    helper()

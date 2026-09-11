@@ -19,14 +19,21 @@ function FindingsTable({ findings, selectedFinding, onSelectFinding }) {
           <span>Risk</span>
         </div>
 
-        {sortedFindings.map((finding, index) => (
-          <FindingRow
-            key={`${finding.file}-${finding.function}-${index}`}
-            finding={finding}
-            isSelected={selectedFinding === finding}
-            onSelect={() => onSelectFinding(finding)}
-          />
-        ))}
+        {sortedFindings.length > 0 ? (
+          sortedFindings.map((finding, index) => (
+            <FindingRow
+              key={`${finding.file}-${finding.function}-${index}`}
+              finding={finding}
+              isSelected={selectedFinding === finding}
+              onSelect={onSelectFinding}
+            />
+          ))
+        ) : (
+          <div className="table-empty">
+            <p>No functions found.</p>
+            <span>Run an analysis to see function-level risks.</span>
+          </div>
+        )}
       </div>
     </div>
   );

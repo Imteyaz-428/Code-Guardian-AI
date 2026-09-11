@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -38,6 +39,17 @@ class AnalysisResult:
     loops: int = 0
     returns: int = 0
     metrics: list[FunctionMetrics] = field(default_factory=list)
+    
+    
+    # Function ID -> Control Flow Graph
+    #
+    # Example:
+    # {
+    #     "main.py::main": <ControlFlowGraph>,
+    #     "main.py::helper": <ControlFlowGraph>,
+    #     "main.py::UserService::login": <ControlFlowGraph>
+    # }
+    
 
 
 @dataclass
