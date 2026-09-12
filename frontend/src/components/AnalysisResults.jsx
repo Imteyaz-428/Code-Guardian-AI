@@ -2,8 +2,13 @@ import SummaryStats from "./SummaryStats";
 import FindingsTable from "./FindingsTable";
 import FindingDetails from "./FindingDetails";
 import CallGraphPanel from "./CallGraphPanel";
+import CFGPanel from "./CFGPanel";
 
-function AnalysisResults({ data, selectedFinding, onSelectFinding }) {
+function AnalysisResults({
+  data,
+  selectedFinding,
+  onSelectFinding,
+}) {
   return (
     <section className="analysis-results">
       <SummaryStats
@@ -13,15 +18,24 @@ function AnalysisResults({ data, selectedFinding, onSelectFinding }) {
 
       <section className="content-grid">
         <FindingsTable
-          findings={data.findings}
-          selectedFinding={selectedFinding}
-          onSelect={onSelectFinding}
-        />
+        findings={data.findings}
+        selectedFinding={selectedFinding}
+        onSelectFinding={onSelectFinding}
+      />
 
-        <FindingDetails finding={selectedFinding} />
+        <FindingDetails
+          finding={selectedFinding}
+        />
       </section>
 
-      <CallGraphPanel callGraph={data.call_graph} />
+      <CallGraphPanel
+        callGraph={data.call_graph}
+      />
+
+      <CFGPanel
+        controlFlowGraphs={data.control_flow_graphs}
+        selectedFinding={selectedFinding}
+      />
     </section>
   );
 }

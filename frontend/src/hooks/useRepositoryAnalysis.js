@@ -7,10 +7,16 @@ import { analyzeRepository } from "../services/api";
  * currently selected finding.
  */
 export function useRepositoryAnalysis(initialPath) {
-  const [repositoryPath, setRepositoryPath] = useState(initialPath);
+  const [repositoryPath, setRepositoryPath] =
+    useState(initialPath);
+
   const [data, setData] = useState(null);
-  const [selectedFinding, setSelectedFinding] = useState(null);
+
+  const [selectedFinding, setSelectedFinding] =
+    useState(null);
+
   const [loading, setLoading] = useState(false);
+
   const [error, setError] = useState("");
 
   const runAnalysis = async () => {
@@ -20,7 +26,8 @@ export function useRepositoryAnalysis(initialPath) {
     setSelectedFinding(null);
 
     try {
-      const result = await analyzeRepository(repositoryPath);
+      const result =
+        await analyzeRepository(repositoryPath);
 
       setData(result);
 
@@ -28,7 +35,11 @@ export function useRepositoryAnalysis(initialPath) {
         setSelectedFinding(result.findings[0]);
       }
     } catch (err) {
-      setError(err.message);
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Analysis failed"
+      );
     } finally {
       setLoading(false);
     }

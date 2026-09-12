@@ -5,7 +5,7 @@ function FindingRow({ finding, isSelected, onSelect }) {
     <button
       type="button"
       className={`table-row ${isSelected ? "selected" : ""}`}
-      onClick={onSelect}
+      onClick={() => onSelect(finding)}
       aria-pressed={isSelected}
     >
       <span className="function-name">

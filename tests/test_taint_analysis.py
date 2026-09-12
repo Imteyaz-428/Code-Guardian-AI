@@ -14,6 +14,7 @@ def analyze_function(
     function_name: str = "test",
     source_names=None,
     sink_names=None,
+    sanitizer_names=None,
 ):
     tree = ast.parse(source)
 
@@ -63,6 +64,7 @@ def analyze_function(
         def_use=def_use,
         source_names=source_names,
         sink_names=sink_names,
+        sanitizer_names=sanitizer_names,
     )
 
     return (
@@ -71,6 +73,11 @@ def analyze_function(
         def_use,
         result,
     )
+
+
+# ================================================================
+# V1 - SOURCE / SINK TESTS
+# ================================================================
 
 
 def test_source_and_sink_are_detected():
@@ -285,7 +292,7 @@ def test():
 
 
 # ================================================================
-# V2 PROPAGATION TESTS
+# V2 - PROPAGATION TESTS
 # ================================================================
 
 
@@ -514,3 +521,352 @@ def test():
         "first",
         "second",
     }
+
+
+# ================================================================
+# V3 - SANITIZER TESTS
+# ================================================================
+
+
+def test_sanitizer_blocks_taint():
+    source = """
+def test():
+    user_input = request_input()
+    safe = sanitize(user_input)
+    execute(safe)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sanitizer_names={"sanitize"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+def test_unsanitized_value_still_reaches_sink():
+    source = """
+def test():
+    user_input = request_input()
+    execute(user_input)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sanitizer_names={"sanitize"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+
+def test_sanitizer_is_recorded():
+    source = """
+def test():
+    user_input = request_input()
+    safe = sanitize(user_input)
+    execute(safe)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sanitizer_names={"sanitize"},
+        sink_names={"execute"},
+    )
+
+    assert len(result.sanitizers) == 1
+    assert result.sanitizers[0].name == "sanitize"
+
+
+def test_custom_sanitizer_blocks_taint():
+    source = """
+def test():
+    user_input = request_input()
+    safe = clean_input(user_input)
+    execute(safe)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sanitizer_names={"clean_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+# ================================================================
+# V4 - VULNERABILITY RULE TESTS
+# ================================================================
+
+
+def test_sql_injection_is_classified():
+    source = """
+def test():
+    user_input = request_input()
+    execute(user_input)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.vulnerability_count == 1
+
+    vulnerability = result.vulnerabilities[0]
+
+    assert vulnerability.rule_id == "SQL_INJECTION"
+    assert vulnerability.name == "SQL Injection"
+    assert vulnerability.severity == "CRITICAL"
+
+
+def test_command_injection_is_classified():
+    source = """
+def test():
+    user_input = request_input()
+    run_command(user_input)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"run_command"},
+    )
+
+    assert result.vulnerability_count == 1
+
+    vulnerability = result.vulnerabilities[0]
+
+    assert vulnerability.rule_id == "COMMAND_INJECTION"
+    assert vulnerability.severity == "CRITICAL"
+
+
+def test_path_traversal_is_classified():
+    source = """
+def test():
+    user_input = request_input()
+    open_file(user_input)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"open_file"},
+    )
+
+    assert result.vulnerability_count == 1
+
+    vulnerability = result.vulnerabilities[0]
+
+    assert vulnerability.rule_id == "PATH_TRAVERSAL"
+    assert vulnerability.severity == "HIGH"
+
+
+def test_no_matching_vulnerability_rule():
+    source = """
+def test():
+    user_input = request_input()
+    print(user_input)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"print"},
+    )
+
+    assert result.finding_count == 1
+    assert result.vulnerability_count == 0
+
+
+# ================================================================
+# V5 - INTERPROCEDURAL TESTS
+# ================================================================
+
+
+def test_interprocedural_source_to_sink():
+    source = """
+def get_data():
+    return request_input()
+
+
+def execute_data(value):
+    execute(value)
+
+
+def main():
+    data = get_data()
+    execute_data(data)
+"""
+
+    tree = ast.parse(source)
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    result = TaintAnalyzer().analyze_project(
+        functions=functions,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count >= 1
+
+
+def test_interprocedural_parameter_propagation():
+    source = """
+def execute_data(value):
+    execute(value)
+
+
+def main():
+    user_input = request_input()
+    execute_data(user_input)
+"""
+
+    tree = ast.parse(source)
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    result = TaintAnalyzer().analyze_project(
+        functions=functions,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count >= 1
+
+
+def test_interprocedural_sanitizer_blocks_flow():
+    source = """
+def execute_data(value):
+    safe = sanitize(value)
+    execute(safe)
+
+
+def main():
+    user_input = request_input()
+    execute_data(user_input)
+"""
+
+    tree = ast.parse(source)
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    result = TaintAnalyzer().analyze_project(
+        functions=functions,
+        source_names={"request_input"},
+        sanitizer_names={"sanitize"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+def test_interprocedural_clean_value_is_not_reported():
+    source = """
+def execute_data(value):
+    execute(value)
+
+
+def main():
+    value = 100
+    execute_data(value)
+"""
+
+    tree = ast.parse(source)
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    result = TaintAnalyzer().analyze_project(
+        functions=functions,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+def test_project_result_contains_vulnerability():
+    source = """
+def execute_data(value):
+    execute(value)
+
+
+def main():
+    user_input = request_input()
+    execute_data(user_input)
+"""
+
+    tree = ast.parse(source)
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        )
+    }
+
+    result = TaintAnalyzer().analyze_project(
+        functions=functions,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.vulnerability_count >= 1
+
+    vulnerability = result.vulnerabilities[0]
+
+    assert vulnerability.rule_id == "SQL_INJECTION"
+    assert vulnerability.severity == "CRITICAL"
