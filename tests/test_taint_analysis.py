@@ -284,7 +284,210 @@ def test():
     )
 
 
-def test_multiple_tainted_flows_are_detected():
+# ================================================================
+# V2 PROPAGATION TESTS
+# ================================================================
+
+
+def test_taint_propagates_through_variable_assignment():
+    source = """
+def test():
+    user_input = request_input()
+    query = user_input
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.source_name == "request_input"
+    assert finding.sink_name == "execute"
+    assert finding.variable == "query"
+
+    assert finding.path == (
+        "request_input",
+        "query",
+        "execute",
+    )
+
+
+def test_taint_propagates_through_multiple_assignments():
+    source = """
+def test():
+    user_input = request_input()
+    query = user_input
+    final_query = query
+    execute(final_query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.variable == "final_query"
+
+    assert finding.path == (
+        "request_input",
+        "final_query",
+        "execute",
+    )
+
+
+def test_taint_propagates_through_string_concatenation():
+    source = """
+def test():
+    user_input = request_input()
+    query = "SELECT * FROM users WHERE id=" + user_input
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.variable == "query"
+
+
+def test_taint_propagates_through_f_string():
+    source = """
+def test():
+    user_input = request_input()
+    query = f"SELECT * FROM users WHERE id={user_input}"
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.variable == "query"
+
+
+def test_taint_does_not_propagate_from_constant_assignment():
+    source = """
+def test():
+    user_input = request_input()
+    query = user_input
+    query = "safe"
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+def test_taint_propagates_through_expression_with_multiple_variables():
+    source = """
+def test():
+    first = request_input()
+    second = "constant"
+    query = first + second
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.variable == "query"
+
+
+def test_clean_expression_is_not_tainted():
+    source = """
+def test():
+    first = 10
+    second = 20
+    query = first + second
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 0
+
+
+def test_direct_source_inside_sink_is_reported():
+    source = """
+def test():
+    execute(request_input())
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.source_name == "request_input"
+    assert finding.sink_name == "execute"
+
+
+def test_taint_propagates_through_method_call_result():
+    source = """
+def test():
+    user_input = request_input()
+    query = user_input.strip()
+    execute(query)
+"""
+
+    _, _, _, result = analyze_function(
+        source,
+        source_names={"request_input"},
+        sink_names={"execute"},
+    )
+
+    assert result.finding_count == 1
+
+    finding = result.findings[0]
+
+    assert finding.variable == "query"
+
+
+def test_multiple_tainted_variables_reach_different_sinks():
     source = """
 def test():
     first = request_input()
@@ -301,3 +504,13 @@ def test():
     )
 
     assert result.finding_count == 2
+
+    variables = {
+        finding.variable
+        for finding in result.findings
+    }
+
+    assert variables == {
+        "first",
+        "second",
+    }

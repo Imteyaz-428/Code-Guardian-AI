@@ -1,68 +1,60 @@
 """
-Taint Analysis.
+Taint Analysis - Milestone 2.
 
-Milestone 1 of Code Guardian AI Taint Analysis.
+Detects propagation of potentially untrusted data from configured
+sources to configured sinks.
 
-This module detects simple intra-procedural flows of potentially
-untrusted data:
+Supported propagation in this milestone:
 
-    SOURCE
-       ↓
-    variable definition
-       ↓
-    variable definition
-       ↓
-    SINK
+    source() -> variable
+    variable -> variable
+    variable -> expression
+    expression containing variable -> sink
 
-The analysis is intentionally isolated.
+Example:
 
-It does NOT yet:
-    - modify ProjectAnalyzer
-    - modify API schemas
-    - modify frontend
-    - perform interprocedural analysis
-    - generate patches
-    - execute code
-    - perform machine-learning risk prediction
+    user_input = request_input()
+    query = user_input
+    execute(query)
 
-It builds on the existing:
+Flow:
 
-    DataFlowResult
-    DefUseResult
+    request_input
+          |
+          v
+      user_input
+          |
+          v
+         query
+          |
+          v
+       execute
 """
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
-
-import ast
 
 from backend.analysis.data_flow import DataFlowResult
 from backend.analysis.def_use import DefUseResult
 
 
+# ================================================================
+# SOURCE
+# ================================================================
+
+
 @dataclass(frozen=True)
 class TaintSource:
-    """
-    Represents a source of potentially untrusted data.
-
-    Example:
-
-        user_input = request_input()
-
-    The source is:
-
-        request_input
-    """
+    """Represents a configured source of potentially untrusted data."""
 
     name: str
     line: int
     kind: str = "source"
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the source into a JSON-friendly dictionary."""
-
         return {
             "name": self.name,
             "line": self.line,
@@ -70,27 +62,20 @@ class TaintSource:
         }
 
 
+# ================================================================
+# SINK
+# ================================================================
+
+
 @dataclass(frozen=True)
 class TaintSink:
-    """
-    Represents a sensitive operation receiving potentially tainted data.
-
-    Example:
-
-        execute(query)
-
-    The sink is:
-
-        execute
-    """
+    """Represents a configured sensitive sink."""
 
     name: str
     line: int
     kind: str = "sink"
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the sink into a JSON-friendly dictionary."""
-
         return {
             "name": self.name,
             "line": self.line,
@@ -98,11 +83,14 @@ class TaintSink:
         }
 
 
+# ================================================================
+# FINDING
+# ================================================================
+
+
 @dataclass(frozen=True)
 class TaintFlowFinding:
-    """
-    Represents one tainted flow from a source to a sink.
-    """
+    """Represents one tainted flow from source to sink."""
 
     source_name: str
     source_line: int
@@ -124,8 +112,6 @@ class TaintFlowFinding:
     )
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the finding into a JSON-friendly dictionary."""
-
         return {
             "source_name": self.source_name,
             "source_line": self.source_line,
@@ -139,11 +125,14 @@ class TaintFlowFinding:
         }
 
 
+# ================================================================
+# RESULT
+# ================================================================
+
+
 @dataclass
 class TaintAnalysisResult:
-    """
-    Complete taint-analysis result for one function.
-    """
+    """Complete taint-analysis result for one function."""
 
     function_name: str
 
@@ -161,19 +150,13 @@ class TaintAnalysisResult:
 
     @property
     def finding_count(self) -> int:
-        """Return the number of tainted flows."""
-
         return len(self.findings)
 
     @property
     def has_findings(self) -> bool:
-        """Return True when tainted flows were detected."""
-
         return bool(self.findings)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the complete result into a dictionary."""
-
         return {
             "function": self.function_name,
             "sources": [
@@ -192,33 +175,51 @@ class TaintAnalysisResult:
         }
 
 
+# ================================================================
+# TAINT STATE
+# ================================================================
+
+
+@dataclass(frozen=True)
+class _TaintOrigin:
+    """
+    Internal representation of where taint originated.
+    """
+
+    source_name: str
+    source_line: int
+
+
+# ================================================================
+# ANALYZER
+# ================================================================
+
+
 class TaintAnalyzer:
     """
-    Performs first-level intra-procedural taint analysis.
+    Performs intra-procedural taint analysis.
 
-    The analyzer identifies:
+    Milestone 2 supports:
 
-        source call
-            ↓
-        variable definition
-            ↓
-        Def-Use chain(s)
-            ↓
-        sink call
+        source() -> x
+        x -> y
+        y -> expression
+        expression -> sink()
 
-    Source and sink names are configurable.
+    The analysis is intentionally conservative.
+
+    If an expression contains a tainted variable, the expression
+    is considered tainted.
 
     Example:
 
-        source_names = {"request_input"}
-        sink_names = {"execute"}
-
-    Then:
-
         user_input = request_input()
-        execute(user_input)
 
-    produces a taint finding.
+        query = "SELECT " + user_input
+
+        execute(query)
+
+    The value of query is considered tainted.
     """
 
     DEFAULT_SOURCE_NAMES = {
@@ -242,28 +243,7 @@ class TaintAnalyzer:
         sink_names: Optional[Iterable[str]] = None,
     ) -> TaintAnalysisResult:
         """
-        Analyze one function for source-to-sink taint flows.
-
-        Parameters
-        ----------
-        function_node:
-            AST node for the function being analyzed.
-
-        data_flow:
-            Existing DataFlowResult for the same function.
-
-        def_use:
-            Existing DefUseResult for the same function.
-
-        source_names:
-            Names considered taint sources.
-
-        sink_names:
-            Names considered taint sinks.
-
-        Returns
-        -------
-        TaintAnalysisResult
+        Analyze one function for tainted source-to-sink flows.
         """
 
         source_names_set = set(
@@ -278,209 +258,924 @@ class TaintAnalyzer:
             else self.DEFAULT_SINK_NAMES
         )
 
+        function_name = self._function_name(
+            data_flow.function_id
+        )
+
         result = TaintAnalysisResult(
-            function_name=data_flow.function_id.split("::")[-1]
+            function_name=function_name
         )
 
-        # ---------------------------------------------------------
-        # DISCOVER SOURCES
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Discover configured sources and sinks.
+        # --------------------------------------------------------
 
-        result.sources.extend(
-            self._find_sources(
-                function_node=function_node,
-                source_names=source_names_set,
-            )
+        result.sources = self._find_sources(
+            function_node,
+            source_names_set,
         )
 
-        # ---------------------------------------------------------
-        # DISCOVER SINKS
-        # ---------------------------------------------------------
-
-        result.sinks.extend(
-            self._find_sinks(
-                function_node=function_node,
-                sink_names=sink_names_set,
-            )
+        result.sinks = self._find_sinks(
+            function_node,
+            sink_names_set,
         )
 
-        # No sources or sinks means there can be no tainted flow.
         if not result.sources or not result.sinks:
             return result
 
-        # ---------------------------------------------------------
-        # MAP DEFINITIONS TO DEF-USE CHAINS
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Build lookup tables for existing Def-Use information.
+        # --------------------------------------------------------
 
-        chains_by_definition: dict[
-            str,
-            list,
-        ] = {}
+        definition_ids = self._build_definition_id_map(
+            data_flow
+        )
 
-        for chain in def_use.chains:
-            chains_by_definition.setdefault(
-                chain.definition_id,
-                [],
-            ).append(chain)
+        # --------------------------------------------------------
+        # Walk the function and propagate taint.
+        # --------------------------------------------------------
 
-        # ---------------------------------------------------------
-        # FIND SOURCE-TAINTED DEFINITIONS
-        # ---------------------------------------------------------
+        tainted: dict[str, _TaintOrigin] = {}
 
-        tainted_definitions: dict[
-            str,
-            tuple[TaintSource, str],
-        ] = {}
-
-        for source in result.sources:
-
-            source_definition_ids = (
-                self._definitions_created_by_source(
-                    source=source,
-                    data_flow=data_flow,
-                )
-            )
-
-            for definition_id, variable in (
-                source_definition_ids
-            ):
-                tainted_definitions[definition_id] = (
-                    source,
-                    variable,
-                )
-
-        # ---------------------------------------------------------
-        # PROPAGATE TAINT THROUGH DEF-USE CHAINS
-        # ---------------------------------------------------------
-
-        changed = True
-
-        while changed:
-            changed = False
-
-            for definition_id, (
-                source,
-                variable,
-            ) in list(
-                tainted_definitions.items()
-            ):
-
-                for chain in chains_by_definition.get(
-                    definition_id,
-                    [],
-                ):
-
-                    # The chain represents:
-                    #
-                    # definition → use
-                    #
-                    # If the use variable is assigned to another
-                    # definition, that definition can become tainted.
-                    #
-                    # The current milestone handles direct variable
-                    # propagation.
-
-                    next_definition_ids = (
-                        self._definitions_for_variable_at_line(
-                            variable=chain.variable,
-                            line=chain.use_line,
-                            data_flow=data_flow,
-                        )
-                    )
-
-                    for next_definition_id in (
-                        next_definition_ids
-                    ):
-                        if (
-                            next_definition_id
-                            not in tainted_definitions
-                        ):
-                            tainted_definitions[
-                                next_definition_id
-                            ] = (
-                                source,
-                                chain.variable,
-                            )
-
-                            changed = True
-
-        # ---------------------------------------------------------
-        # MATCH TAINTED DATA TO SINKS
-        # ---------------------------------------------------------
-
-        for definition_id, (
-            source,
-            variable,
-        ) in tainted_definitions.items():
-
-            for chain in chains_by_definition.get(
-                definition_id,
-                [],
-            ):
-
-                for sink in result.sinks:
-
-                    if chain.use_line != sink.line:
-                        continue
-
-                    result.findings.append(
-                        TaintFlowFinding(
-                            source_name=source.name,
-                            source_line=source.line,
-                            sink_name=sink.name,
-                            sink_line=sink.line,
-                            variable=variable,
-                            definition_id=definition_id,
-                            use_id=chain.use_id,
-                            path=(
-                                source.name,
-                                variable,
-                                sink.name,
-                            ),
-                        )
-                    )
+        self._analyze_statements(
+            statements=function_node.body,
+            tainted=tainted,
+            source_names=source_names_set,
+            sink_names=sink_names_set,
+            result=result,
+            data_flow=data_flow,
+            def_use=def_use,
+            definition_ids=definition_ids,
+        )
 
         return result
 
-    # -------------------------------------------------------------
-    # SOURCE DISCOVERY
-    # -------------------------------------------------------------
+    # ============================================================
+    # STATEMENT ANALYSIS
+    # ============================================================
+
+    def _analyze_statements(
+        self,
+        statements: list[ast.stmt],
+        tainted: dict[str, _TaintOrigin],
+        source_names: set[str],
+        sink_names: set[str],
+        result: TaintAnalysisResult,
+        data_flow: DataFlowResult,
+        def_use: DefUseResult,
+        definition_ids: dict[tuple[str, int], str],
+    ) -> None:
+        """
+        Analyze statements in source order.
+
+        Branches and loops are handled conservatively by propagating
+        taint discovered inside their bodies back to the surrounding
+        state.
+        """
+
+        for statement in statements:
+
+            # ----------------------------------------------------
+            # ASSIGNMENT
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.Assign):
+
+                value_taint = self._expression_taint(
+                    statement.value,
+                    tainted,
+                    source_names,
+                )
+
+                # A direct source call creates taint even when the
+                # expression does not contain a previously tainted
+                # variable.
+                source_origin = self._source_origin(
+                    statement.value,
+                    source_names,
+                    result.sources,
+                )
+
+                origin = (
+                    source_origin
+                    if source_origin is not None
+                    else value_taint
+                )
+
+                for target in statement.targets:
+                    self._assign_taint(
+                        target,
+                        origin,
+                        tainted,
+                    )
+
+                # A sink can also appear inside an assignment RHS.
+                self._check_sinks_in_expression(
+                    statement.value,
+                    tainted,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # ANNOTATED ASSIGNMENT
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.AnnAssign):
+
+                origin = None
+
+                if statement.value is not None:
+
+                    origin = self._source_origin(
+                        statement.value,
+                        source_names,
+                        result.sources,
+                    )
+
+                    if origin is None:
+                        origin = self._expression_taint(
+                            statement.value,
+                            tainted,
+                            source_names,
+                        )
+
+                    self._check_sinks_in_expression(
+                        statement.value,
+                        tainted,
+                        source_names,
+                        sink_names,
+                        result,
+                        data_flow,
+                        def_use,
+                        definition_ids,
+                    )
+
+                self._assign_taint(
+                    statement.target,
+                    origin,
+                    tainted,
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # AUGMENTED ASSIGNMENT
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.AugAssign):
+
+                existing_origin = None
+
+                if isinstance(
+                    statement.target,
+                    ast.Name,
+                ):
+                    existing_origin = tainted.get(
+                        statement.target.id
+                    )
+
+                value_origin = self._expression_taint(
+                    statement.value,
+                    tainted,
+                    source_names,
+                )
+
+                origin = (
+                    existing_origin
+                    if existing_origin is not None
+                    else value_origin
+                )
+
+                self._assign_taint(
+                    statement.target,
+                    origin,
+                    tainted,
+                )
+
+                self._check_sinks_in_expression(
+                    statement.value,
+                    tainted,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # IF
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.If):
+
+                # Analyze the condition for possible sinks.
+                self._check_sinks_in_expression(
+                    statement.test,
+                    tainted,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                # Copy state for each branch.
+                true_state = dict(tainted)
+                false_state = dict(tainted)
+
+                self._analyze_statements(
+                    statement.body,
+                    true_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                self._analyze_statements(
+                    statement.orelse,
+                    false_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                # Conservative merge:
+                #
+                # If a variable can be tainted on either path,
+                # keep it tainted.
+                merged = dict(tainted)
+
+                for name, origin in true_state.items():
+                    merged.setdefault(name, origin)
+
+                for name, origin in false_state.items():
+                    merged.setdefault(name, origin)
+
+                tainted.clear()
+                tainted.update(merged)
+
+                continue
+
+            # ----------------------------------------------------
+            # LOOP
+            # ----------------------------------------------------
+
+            if isinstance(
+                statement,
+                (
+                    ast.For,
+                    ast.AsyncFor,
+                    ast.While,
+                ),
+            ):
+
+                if isinstance(
+                    statement,
+                    ast.While,
+                ):
+                    self._check_sinks_in_expression(
+                        statement.test,
+                        tainted,
+                        source_names,
+                        sink_names,
+                        result,
+                        data_flow,
+                        def_use,
+                        definition_ids,
+                    )
+
+                else:
+                    self._check_sinks_in_expression(
+                        statement.iter,
+                        tainted,
+                        source_names,
+                        sink_names,
+                        result,
+                        data_flow,
+                        def_use,
+                        definition_ids,
+                    )
+
+                loop_state = dict(tainted)
+
+                self._analyze_statements(
+                    statement.body,
+                    loop_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                # Loop body may execute zero or more times, so
+                # preserve taint from either state.
+                for name, origin in loop_state.items():
+                    tainted.setdefault(
+                        name,
+                        origin,
+                    )
+
+                self._analyze_statements(
+                    statement.orelse,
+                    tainted,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # RETURN
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.Return):
+
+                if statement.value is not None:
+                    self._check_sinks_in_expression(
+                        statement.value,
+                        tainted,
+                        source_names,
+                        sink_names,
+                        result,
+                        data_flow,
+                        def_use,
+                        definition_ids,
+                    )
+
+                continue
+
+            # ----------------------------------------------------
+            # EXPRESSION / FUNCTION CALL
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.Expr):
+
+                self._check_sinks_in_expression(
+                    statement.value,
+                    tainted,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # TRY
+            # ----------------------------------------------------
+
+            if isinstance(statement, ast.Try):
+
+                try_state = dict(tainted)
+
+                self._analyze_statements(
+                    statement.body,
+                    try_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                for handler in statement.handlers:
+
+                    handler_state = dict(tainted)
+
+                    self._analyze_statements(
+                        handler.body,
+                        handler_state,
+                        source_names,
+                        sink_names,
+                        result,
+                        data_flow,
+                        def_use,
+                        definition_ids,
+                    )
+
+                    for name, origin in handler_state.items():
+                        try_state.setdefault(
+                            name,
+                            origin,
+                        )
+
+                self._analyze_statements(
+                    statement.orelse,
+                    try_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                self._analyze_statements(
+                    statement.finalbody,
+                    try_state,
+                    source_names,
+                    sink_names,
+                    result,
+                    data_flow,
+                    def_use,
+                    definition_ids,
+                )
+
+                tainted.clear()
+                tainted.update(try_state)
+
+                continue
+
+            # ----------------------------------------------------
+            # Generic statement handling.
+            # ----------------------------------------------------
+
+            self._check_sinks_in_expression(
+                statement,
+                tainted,
+                source_names,
+                sink_names,
+                result,
+                data_flow,
+                def_use,
+                definition_ids,
+            )
+
+    # ============================================================
+    # EXPRESSION TAINT
+    # ============================================================
+
+    def _expression_taint(
+        self,
+        node: ast.AST,
+        tainted: dict[str, _TaintOrigin],
+        source_names: set[str],
+    ) -> Optional[_TaintOrigin]:
+        """
+        Determine whether an expression contains tainted data.
+
+        Examples:
+
+            query = user_input
+
+            query = "SELECT " + user_input
+
+            query = f"SELECT {user_input}"
+
+        All are considered tainted when user_input is tainted.
+        """
+
+        # Direct variable.
+        if isinstance(node, ast.Name):
+            return tainted.get(node.id)
+
+        # Direct source call.
+        source_origin = self._source_origin_from_call(
+            node,
+            source_names,
+        )
+
+        if source_origin is not None:
+            return source_origin
+
+        # Recursively inspect child expressions.
+        for child in ast.iter_child_nodes(node):
+
+            origin = self._expression_taint(
+                child,
+                tainted,
+                source_names,
+            )
+
+            if origin is not None:
+                return origin
+
+        return None
+
+    # ============================================================
+    # SOURCE ORIGIN
+    # ============================================================
+
+    @staticmethod
+    def _source_origin(
+        node: ast.AST,
+        source_names: set[str],
+        sources: list[TaintSource],
+    ) -> Optional[_TaintOrigin]:
+        """
+        Return the source origin contained in an expression.
+        """
+
+        for ast_node in ast.walk(node):
+
+            if not isinstance(
+                ast_node,
+                ast.Call,
+            ):
+                continue
+
+            name = TaintAnalyzer._call_name(
+                ast_node
+            )
+
+            if name not in source_names:
+                continue
+
+            line = getattr(
+                ast_node,
+                "lineno",
+                0,
+            )
+
+            return _TaintOrigin(
+                source_name=name,
+                source_line=line,
+            )
+
+        return None
+
+    @staticmethod
+    def _source_origin_from_call(
+        node: ast.AST,
+        source_names: set[str],
+    ) -> Optional[_TaintOrigin]:
+        """Return origin when node itself is a source call."""
+
+        if not isinstance(node, ast.Call):
+            return None
+
+        name = TaintAnalyzer._call_name(node)
+
+        if name not in source_names:
+            return None
+
+        return _TaintOrigin(
+            source_name=name,
+            source_line=getattr(
+                node,
+                "lineno",
+                0,
+            ),
+        )
+
+    # ============================================================
+    # ASSIGNMENT
+    # ============================================================
+
+    @staticmethod
+    def _assign_taint(
+        target: ast.AST,
+        origin: Optional[_TaintOrigin],
+        tainted: dict[str, _TaintOrigin],
+    ) -> None:
+        """
+        Assign taint to a variable target.
+
+        If the RHS is not tainted, the previous taint is removed
+        because the assignment overwrites the previous value.
+        """
+
+        if isinstance(target, ast.Name):
+
+            if origin is None:
+                tainted.pop(
+                    target.id,
+                    None,
+                )
+            else:
+                tainted[target.id] = origin
+
+            return
+
+        # Tuple/list unpacking.
+        if isinstance(
+            target,
+            (
+                ast.Tuple,
+                ast.List,
+            ),
+        ):
+            for element in target.elts:
+                TaintAnalyzer._assign_taint(
+                    element,
+                    origin,
+                    tainted,
+                )
+
+    # ============================================================
+    # SINK DETECTION
+    # ============================================================
+
+    def _check_sinks_in_expression(
+        self,
+        node: ast.AST,
+        tainted: dict[str, _TaintOrigin],
+        source_names: set[str],
+        sink_names: set[str],
+        result: TaintAnalysisResult,
+        data_flow: DataFlowResult,
+        def_use: DefUseResult,
+        definition_ids: dict[tuple[str, int], str],
+    ) -> None:
+        """
+        Find configured sink calls and determine whether any
+        argument contains tainted data.
+        """
+
+        for ast_node in ast.walk(node):
+
+            if not isinstance(
+                ast_node,
+                ast.Call,
+            ):
+                continue
+
+            sink_name = self._call_name(
+                ast_node
+            )
+
+            if sink_name not in sink_names:
+                continue
+
+            sink_line = getattr(
+                ast_node,
+                "lineno",
+                0,
+            )
+
+            # ----------------------------------------------------
+            # Check each sink argument.
+            # ----------------------------------------------------
+
+            for argument in ast_node.args:
+
+                origin = self._expression_taint(
+                    argument,
+                    tainted,
+                    source_names,
+                )
+
+                # Direct source inside sink.
+                if origin is None:
+                    origin = self._source_origin(
+                        argument,
+                        source_names,
+                        result.sources,
+                    )
+
+                if origin is None:
+                    continue
+
+                variable = self._tainted_variable(
+                    argument,
+                    tainted,
+                )
+
+                # If the argument is an expression rather than a
+                # simple variable, use a readable representation.
+                if variable is None:
+                    variable = self._expression_label(
+                        argument
+                    )
+
+                definition_id = (
+                    self._definition_id_for_variable(
+                        variable,
+                        sink_line,
+                        data_flow,
+                        definition_ids,
+                    )
+                )
+
+                use_id = self._use_id_for_sink(
+                    variable,
+                    sink_line,
+                    def_use,
+                )
+
+                path = (
+                    origin.source_name,
+                    variable,
+                    sink_name,
+                )
+
+                result.findings.append(
+                    TaintFlowFinding(
+                        source_name=origin.source_name,
+                        source_line=origin.source_line,
+                        sink_name=sink_name,
+                        sink_line=sink_line,
+                        variable=variable,
+                        definition_id=definition_id,
+                        use_id=use_id,
+                        path=path,
+                    )
+                )
+
+    # ============================================================
+    # VARIABLE EXTRACTION
+    # ============================================================
+
+    @staticmethod
+    def _tainted_variable(
+        node: ast.AST,
+        tainted: dict[str, _TaintOrigin],
+    ) -> Optional[str]:
+        """
+        Return the first tainted variable contained in an expression.
+        """
+
+        if isinstance(node, ast.Name):
+            if node.id in tainted:
+                return node.id
+
+        for child in ast.iter_child_nodes(node):
+
+            variable = TaintAnalyzer._tainted_variable(
+                child,
+                tainted,
+            )
+
+            if variable is not None:
+                return variable
+
+        return None
+
+    @staticmethod
+    def _expression_label(
+        node: ast.AST,
+    ) -> str:
+        """
+        Return a readable label for a non-variable tainted
+        expression.
+        """
+
+        if isinstance(node, ast.Call):
+            name = TaintAnalyzer._call_name(node)
+
+            if name:
+                return f"{name}(...)"
+
+        if isinstance(node, ast.Constant):
+            return repr(node.value)
+
+        return "<tainted-expression>"
+
+    # ============================================================
+    # DEFINITION / USE MAPPING
+    # ============================================================
+
+    @staticmethod
+    def _build_definition_id_map(
+        data_flow: DataFlowResult,
+    ) -> dict[tuple[str, int], str]:
+        """
+        Map:
+
+            (variable, line) -> definition ID
+
+        to the same D0, D1, ... ordering used by
+        Reaching Definitions.
+        """
+
+        result: dict[
+            tuple[str, int],
+            str,
+        ] = {}
+
+        for index, definition in enumerate(
+            data_flow.definitions
+        ):
+            result.setdefault(
+                (
+                    definition.name,
+                    definition.line,
+                ),
+                f"D{index}",
+            )
+
+        return result
+
+    @staticmethod
+    def _definition_id_for_variable(
+        variable: str,
+        sink_line: int,
+        data_flow: DataFlowResult,
+        definition_ids: dict[tuple[str, int], str],
+    ) -> str:
+        """
+        Find the latest definition of a variable before the sink.
+        """
+
+        candidates = []
+
+        for definition in data_flow.definitions:
+
+            if definition.name != variable:
+                continue
+
+            if definition.line > sink_line:
+                continue
+
+            definition_id = definition_ids.get(
+                (
+                    definition.name,
+                    definition.line,
+                )
+            )
+
+            if definition_id is None:
+                continue
+
+            candidates.append(
+                (
+                    definition.line,
+                    definition_id,
+                )
+            )
+
+        if not candidates:
+            return ""
+
+        candidates.sort(
+            key=lambda item: item[0]
+        )
+
+        return candidates[-1][1]
+
+    @staticmethod
+    def _use_id_for_sink(
+        variable: str,
+        sink_line: int,
+        def_use: DefUseResult,
+    ) -> str:
+        """
+        Find the Def-Use ID for a variable reaching a sink.
+        """
+
+        for chain in def_use.chains:
+
+            if chain.variable != variable:
+                continue
+
+            if chain.use_line != sink_line:
+                continue
+
+            return chain.use_id
+
+        return ""
+
+    # ============================================================
+    # SOURCE / SINK DISCOVERY
+    # ============================================================
 
     @staticmethod
     def _find_sources(
         function_node: ast.FunctionDef | ast.AsyncFunctionDef,
         source_names: set[str],
     ) -> list[TaintSource]:
-        """
-        Find configured source calls inside the function.
-
-        Example:
-
-            value = request_input()
-
-        produces:
-
-            TaintSource(
-                name="request_input",
-                line=2,
-            )
-        """
+        """Find configured source calls."""
 
         sources: list[TaintSource] = []
 
-        for node in ast.walk(function_node):
+        for node in TaintAnalyzer._walk_function(
+            function_node
+        ):
 
-            if not isinstance(node, ast.Call):
+            if not isinstance(
+                node,
+                ast.Call,
+            ):
                 continue
 
-            if isinstance(node.func, ast.Name):
-                name = node.func.id
-
-            elif isinstance(node.func, ast.Attribute):
-                name = node.func.attr
-
-            else:
-                continue
+            name = TaintAnalyzer._call_name(node)
 
             if name not in source_names:
                 continue
@@ -488,51 +1183,36 @@ class TaintAnalyzer:
             sources.append(
                 TaintSource(
                     name=name,
-                    line=getattr(node, "lineno", 0),
+                    line=getattr(
+                        node,
+                        "lineno",
+                        0,
+                    ),
                 )
             )
 
         return sources
-
-    # -------------------------------------------------------------
-    # SINK DISCOVERY
-    # -------------------------------------------------------------
 
     @staticmethod
     def _find_sinks(
         function_node: ast.FunctionDef | ast.AsyncFunctionDef,
         sink_names: set[str],
     ) -> list[TaintSink]:
-        """
-        Find configured sink calls inside the function.
-
-        Example:
-
-            execute(value)
-
-        produces:
-
-            TaintSink(
-                name="execute",
-                line=3,
-            )
-        """
+        """Find configured sink calls."""
 
         sinks: list[TaintSink] = []
 
-        for node in ast.walk(function_node):
+        for node in TaintAnalyzer._walk_function(
+            function_node
+        ):
 
-            if not isinstance(node, ast.Call):
+            if not isinstance(
+                node,
+                ast.Call,
+            ):
                 continue
 
-            if isinstance(node.func, ast.Name):
-                name = node.func.id
-
-            elif isinstance(node.func, ast.Attribute):
-                name = node.func.attr
-
-            else:
-                continue
+            name = TaintAnalyzer._call_name(node)
 
             if name not in sink_names:
                 continue
@@ -540,93 +1220,85 @@ class TaintAnalyzer:
             sinks.append(
                 TaintSink(
                     name=name,
-                    line=getattr(node, "lineno", 0),
+                    line=getattr(
+                        node,
+                        "lineno",
+                        0,
+                    ),
                 )
             )
 
         return sinks
 
-    # -------------------------------------------------------------
-    # SOURCE → DEFINITION
-    # -------------------------------------------------------------
+    # ============================================================
+    # AST HELPERS
+    # ============================================================
 
     @staticmethod
-    def _definitions_created_by_source(
-        source: TaintSource,
-        data_flow: DataFlowResult,
-    ) -> list[tuple[str, str]]:
-        """
-        Find definitions on the same line as a source call.
+    def _call_name(
+        node: ast.Call,
+    ) -> str:
+        """Return the function/method name of a call."""
 
-        Example:
-
-            user_input = request_input()
-
-        Data Flow:
-
-            definition:
-                user_input
-
-        source:
-
-            request_input
-
-        returns the definition candidate.
-        """
-
-        definitions: list[tuple[str, str]] = []
-
-        for index, definition in enumerate(
-            data_flow.definitions
+        if isinstance(
+            node.func,
+            ast.Name,
         ):
-            if definition.line != source.line:
-                continue
+            return node.func.id
 
-            definition_id = f"D{index}"
+        if isinstance(
+            node.func,
+            ast.Attribute,
+        ):
+            return node.func.attr
 
-            # Parameters are never created by a source call.
-            if definition.kind == "parameter":
-                continue
+        return ""
 
-            definitions.append(
+    @staticmethod
+    def _walk_function(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ):
+        """
+        Walk the function while excluding nested functions/classes.
+        """
+
+        stack = list(function_node.body)
+
+        while stack:
+
+            node = stack.pop()
+
+            if isinstance(
+                node,
                 (
-                    definition_id,
-                    definition.name,
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                ),
+            ):
+                continue
+
+            yield node
+
+            stack.extend(
+                reversed(
+                    list(
+                        ast.iter_child_nodes(node)
+                    )
                 )
             )
 
-        return definitions
-
-    # -------------------------------------------------------------
-    # FIND DEFINITIONS FOR PROPAGATION
-    # -------------------------------------------------------------
-
     @staticmethod
-    def _definitions_for_variable_at_line(
-        variable: str,
-        line: int,
-        data_flow: DataFlowResult,
-    ) -> list[str]:
-        """
-        Find definitions of a variable at or after a use.
+    def _function_name(
+        function_id: str,
+    ) -> str:
+        """Extract function name from Code Guardian function ID."""
 
-        This helper intentionally keeps propagation conservative
-        for the first milestone.
-        """
+        if "::" in function_id:
+            return function_id.rsplit(
+                "::",
+                1,
+            )[-1]
 
-        definitions: list[str] = []
-
-        for index, definition in enumerate(
-            data_flow.definitions
-        ):
-            if definition.name != variable:
-                continue
-
-            if definition.line < line:
-                continue
-
-            definitions.append(
-                f"D{index}"
-            )
-
-        return definitions
+        return function_id
