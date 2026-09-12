@@ -13,9 +13,9 @@ def test_analyze_api_returns_control_flow_graph(tmp_path, monkeypatch):
     for functions found in the repository.
     """
 
-    # ---------------------------------------------------------
+    
     # Create a temporary test repository
-    # ---------------------------------------------------------
+    
 
     repository = tmp_path / "sample_repo"
     repository.mkdir()
@@ -31,9 +31,9 @@ def calculate(x):
 """.strip()
     )
 
-    # ---------------------------------------------------------
+    
     # Allow the temporary repository for this test
-    # ---------------------------------------------------------
+    
 
     monkeypatch.setattr(
         settings,
@@ -41,9 +41,9 @@ def calculate(x):
         tmp_path,
     )
 
-    # ---------------------------------------------------------
+    
     # Call API
-    # ---------------------------------------------------------
+    
 
     response = client.post(
         "/analyze",
@@ -52,9 +52,9 @@ def calculate(x):
         },
     )
 
-    # ---------------------------------------------------------
+    
     # Basic response validation
-    # ---------------------------------------------------------
+    
 
     assert response.status_code == 200
 
@@ -62,9 +62,9 @@ def calculate(x):
 
     assert "control_flow_graphs" in data
 
-    # ---------------------------------------------------------
+    
     # CFG validation
-    # ---------------------------------------------------------
+    
 
     cfgs = data["control_flow_graphs"]
 
@@ -80,9 +80,9 @@ def calculate(x):
     # CFG must contain edges.
     assert len(cfg["edges"]) > 0
 
-    # ---------------------------------------------------------
+    
     # Check ENTRY and EXIT nodes
-    # ---------------------------------------------------------
+    
 
     node_types = {
         node["type"]
@@ -92,9 +92,9 @@ def calculate(x):
     assert "entry" in node_types
     assert "exit" in node_types
 
-    # ---------------------------------------------------------
+    
     # Check condition node
-    # ---------------------------------------------------------
+    
 
     condition_nodes = [
         node
