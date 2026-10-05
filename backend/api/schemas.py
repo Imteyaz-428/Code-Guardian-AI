@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -20,9 +22,7 @@ class Finding(BaseModel):
     reasons: list[str]
 
 
-
 # Call Graph schemas
-
 
 
 class CallGraphEdge(BaseModel):
@@ -35,9 +35,7 @@ class CallGraphResponse(BaseModel):
     edges: list[CallGraphEdge] = Field(default_factory=list)
 
 
-
 # Control Flow Graph schemas
-
 
 
 class CFGNode(BaseModel):
@@ -53,9 +51,7 @@ class CFGResponse(BaseModel):
     edges: list[tuple[int, int]] = Field(default_factory=list)
 
 
-
 # Analysis schemas
-
 
 
 class AnalysisSummary(BaseModel):
@@ -80,3 +76,11 @@ class AnalysisResponse(BaseModel):
     control_flow_graphs: list[CFGResponse] = Field(
         default_factory=list
     )
+
+    # Unified Code Graph
+    unified_code_graph: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+    # Static-analysis risk labels
+    risk_labels: Any = None

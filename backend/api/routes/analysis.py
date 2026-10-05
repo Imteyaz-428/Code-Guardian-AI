@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
 
 from backend.analysis.project_analyzer import ProjectAnalyzer
 from backend.api.schemas import AnalysisResponse, AnalyzeRequest
@@ -43,15 +45,30 @@ def _normalize_function_id(function_id: str, root: Path) -> str:
 
 @router.post("/analyze", response_model=AnalysisResponse)
 def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
-    """Analyze a repository and return structural analysis results."""
+    """
+    Analyze a repository and return the complete static-analysis result.
 
-   
+    Current API output includes:
+
+    - Function risk findings
+    - Call graph
+    - Control-flow graphs
+    - Unified code graph
+    - Risk labels
+    - Analysis errors
+    """
+
+    # ---------------------------------------------------------
     # Run repository analysis
-   
+    # ---------------------------------------------------------
 
     try:
         repository = RepositoryManager(request.repository_path)
-        analyzer = ProjectAnalyzer(repository.repository_path)
+
+        analyzer = ProjectAnalyzer(
+            repository.repository_path
+        )
+
         results = analyzer.analyze()
 
     except ValueError as exc:
@@ -68,24 +85,39 @@ def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
 
     root = repository.repository_path.resolve()
 
-   
+    # ---------------------------------------------------------
     # Risk findings
-   
+    # ---------------------------------------------------------
 
-    findings = []
+    findings: list[dict[str, Any]] = []
 
-    risk_engine = RiskEngine(repository_path=root)
+    risk_engine = RiskEngine(
+        repository_path=root
+    )
 
     for result in results:
-        file_path = Path(result.file_path).resolve()
+
+        file_path = Path(
+            result.file_path
+        ).resolve()
 
         try:
-            display_path = file_path.relative_to(root).as_posix()
+            display_path = (
+                file_path
+                .relative_to(root)
+                .as_posix()
+            )
+
         except ValueError:
             display_path = result.file_path
 
         for metrics in result.metrics:
-            finding = risk_engine.calculate_function_risk(metrics)
+
+            finding = (
+                risk_engine.calculate_function_risk(
+                    metrics
+                )
+            )
 
             findings.append(
                 {
@@ -98,9 +130,9 @@ def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
                 }
             )
 
-   
+    # ---------------------------------------------------------
     # Call Graph
-   
+    # ---------------------------------------------------------
 
     call_graph = {
         "nodes": [],
@@ -108,26 +140,41 @@ def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
     }
 
     if analyzer.call_graph is not None:
+
         call_graph["nodes"] = [
-            _normalize_function_id(function_id, root)
-            for function_id in analyzer.call_graph.get_all_functions()
+            _normalize_function_id(
+                function_id,
+                root,
+            )
+            for function_id
+            in analyzer.call_graph.get_all_functions()
         ]
 
         call_graph["edges"] = [
             {
-                "caller": _normalize_function_id(caller, root),
-                "callee": _normalize_function_id(callee, root),
+                "caller": _normalize_function_id(
+                    caller,
+                    root,
+                ),
+                "callee": _normalize_function_id(
+                    callee,
+                    root,
+                ),
             }
-            for caller, callee in analyzer.call_graph.get_edges()
+            for caller, callee
+            in analyzer.call_graph.get_edges()
         ]
 
-   
+    # ---------------------------------------------------------
     # Control Flow Graphs
-   
+    # ---------------------------------------------------------
 
     control_flow_graphs = []
 
-    for function_id, cfg in analyzer.control_flow_graphs.items():
+    for function_id, cfg in (
+        analyzer.control_flow_graphs.items()
+    ):
+
         control_flow_graphs.append(
             {
                 "function": _normalize_function_id(
@@ -145,9 +192,39 @@ def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
             }
         )
 
-   
+    # ---------------------------------------------------------
+    # Unified Code Graph
+    # ---------------------------------------------------------
+
+    unified_code_graph: dict[str, Any] = {}
+
+    if analyzer.unified_code_graph is not None:
+
+        unified_code_graph = jsonable_encoder(
+            analyzer.unified_code_graph.to_dict()
+        )
+
+    # ---------------------------------------------------------
+    # Risk Labels
+    # ---------------------------------------------------------
+
+    risk_labels = None
+
+    if analyzer.unified_code_graph is not None:
+
+        try:
+            risk_labels = jsonable_encoder(
+                analyzer.generate_risk_labels()
+            )
+
+        except Exception:
+            # Risk labels should not make the complete
+            # static analysis endpoint fail.
+            risk_labels = None
+
+    # ---------------------------------------------------------
     # Final API response
-   
+    # ---------------------------------------------------------
 
     return AnalysisResponse(
         summary={
@@ -155,8 +232,16 @@ def analyze_project(request: AnalyzeRequest) -> AnalysisResponse:
             "functions_analyzed": len(findings),
             "files_failed": len(analyzer.errors),
         },
+
         findings=findings,
+
         errors=analyzer.errors,
+
         call_graph=call_graph,
+
         control_flow_graphs=control_flow_graphs,
+
+        unified_code_graph=unified_code_graph,
+
+        risk_labels=risk_labels,
     )

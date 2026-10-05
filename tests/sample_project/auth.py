@@ -10,6 +10,7 @@ def login(username, password):
 
 def logout(user):
     print(f"{user} logged out")
+    
 
 
 def validate_user(username, password, role):

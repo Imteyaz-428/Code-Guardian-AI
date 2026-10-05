@@ -19,7 +19,6 @@ It builds on the existing:
 This module does not modify any existing analysis layer.
 """
 
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -94,10 +93,14 @@ class DefUseResult:
         default_factory=list
     )
 
-    # Each use receives a stable local ID:
+    # Stable local IDs for valid variable uses.
     #
     # U0, U1, U2, ...
     #
+    # use_ids maps:
+    #     "U0" -> 0
+    #     "U1" -> 1
+    #     "U2" -> 2
     use_ids: dict[str, int] = field(
         default_factory=dict
     )
@@ -164,126 +167,124 @@ class DefUseAnalyzer:
         data_flow: DataFlowResult,
         reaching_definitions: ReachingDefinitionsResult,
     ) -> DefUseResult:
-        """
-        Build definition-use chains.
 
-        For every variable use:
-
-            1. Find the CFG node containing the use.
-            2. Look at definitions reaching that CFG node.
-            3. Keep only definitions of the same variable.
-            4. Create one DefUseChain for each matching definition.
-        """
+        # DataFlowResult uses `function_id`.
+        function_name = data_flow.function_id.split("::")[-1]
 
         result = DefUseResult(
-        function_name=reaching_definitions.function_name
-    )
-
-        # Reaching Definitions stores DefinitionRef objects.
-        definitions_by_id = {
-            definition.id: definition
-            for definition in reaching_definitions.definitions
-        }
-
-     
-        # Process every variable use
-     
-
-       
-        # Process every variable use
-        
+            function_name=function_name
+        )
 
         next_use_id = 0
 
         for use in data_flow.uses:
 
-            # A variable use can be associated with one or more CFG
-            # nodes. Usually there is one node.
-            #
-            # We consider all associated nodes and merge their reaching
-            # definitions.
-            reaching_definition_ids: set[str] = set()
-
-            for cfg_node_id in use.cfg_node_ids:
-
-                reaching_definition_ids.update(
-                    reaching_definitions.in_sets.get(
-                        cfg_node_id,
-                        set(),
-                    )
-                )
-
-           
-            # Find definitions of the same variable.
-           
-
-            matching_definitions = []
-
-            for definition_id in sorted(
-                reaching_definition_ids
-            ):
-
-                definition_ref = definitions_by_id.get(
-                    definition_id
-                )
-
-                if definition_ref is None:
-                    continue
-
-                definition = definition_ref.definition
-
-                if definition.name != use.name:
-                    continue
-
-                matching_definitions.append(
-                    definition_ref
-                )
-
-           
-            # If no definition reaches this use, this use does not
-            # participate in a Def-Use Chain.
+            # ---------------------------------------------------------
+            # Ignore function/call names.
             #
             # Example:
             #
             #     print(x)
             #
-            # "print" is a Name/Load in the AST, but there is no
-            # definition of print inside the function.
-            #
-            # Therefore it should not consume a Def-Use ID.
-           
-
-            if not matching_definitions:
+            # `print` is a call, not a variable use.
+            # ---------------------------------------------------------
+            if use.context == "call":
                 continue
 
+            # ---------------------------------------------------------
+            # Find all definitions reaching the CFG node(s) where
+            # this variable is used.
+            # ---------------------------------------------------------
+
+            reaching_definition_refs = []
+
+            seen_definition_ids: set[str] = set()
+
+            for node_id in use.cfg_node_ids:
+
+                node_definitions = (
+                    reaching_definitions.get_reaching_definitions(
+                        node_id
+                    )
+                )
+
+                for definition_ref in node_definitions:
+
+                    # Avoid duplicate definitions if the same
+                    # definition reaches multiple CFG nodes.
+                    if definition_ref.id in seen_definition_ids:
+                        continue
+
+                    # Only connect the same variable.
+                    if definition_ref.definition.name != use.name:
+                        continue
+
+                    seen_definition_ids.add(
+                        definition_ref.id
+                    )
+
+                    reaching_definition_refs.append(
+                        definition_ref
+                    )
+
+            # ---------------------------------------------------------
+            # No matching definition means this variable use does not
+            # produce a Def-Use chain.
+            #
+            # Therefore it does NOT consume a U ID.
+            # ---------------------------------------------------------
+
+            if not reaching_definition_refs:
+                continue
+
+            # ---------------------------------------------------------
+            # Assign stable use ID.
+            # ---------------------------------------------------------
+
             use_id = f"U{next_use_id}"
+
             result.use_ids[use_id] = next_use_id
+
             next_use_id += 1
 
-           
-            # Create one chain for every reaching definition.
-           
+            # ---------------------------------------------------------
+            # Create one DefUseChain for every reaching definition.
+            #
+            # Example:
+            #
+            #     if condition:
+            #         x = 10       # D1
+            #     else:
+            #         x = 20       # D2
+            #
+            #     print(x)         # U0
+            #
+            # Result:
+            #
+            #     D1 → U0
+            #     D2 → U0
+            # ---------------------------------------------------------
 
-            for definition_ref in matching_definitions:
+            for definition_ref in reaching_definition_refs:
 
                 definition = definition_ref.definition
 
-                result.chains.append(
-                    DefUseChain(
-                        definition_id=definition_ref.id,
-                        use_id=use_id,
-                        variable=use.name,
-                        definition_line=definition.line,
-                        use_line=use.line,
-                        definition_kind=definition.kind,
-                        use_context=use.context,
-                        definition_cfg_node_ids=tuple(
-                            definition.cfg_node_ids
-                        ),
-                        use_cfg_node_ids=tuple(
-                            use.cfg_node_ids
-                        ),
-                    )
+                chain = DefUseChain(
+                    definition_id=definition_ref.id,
+                    use_id=use_id,
+                    variable=use.name,
+                    definition_line=definition.line,
+                    use_line=use.line,
+                    definition_kind=definition.kind,
+                    use_context=use.context,
+                    definition_cfg_node_ids=tuple(
+                        definition.cfg_node_ids
+                    ),
+                    use_cfg_node_ids=tuple(
+                        use.cfg_node_ids
+                    ),
                 )
+
+                result.chains.append(chain)
 
         return result
