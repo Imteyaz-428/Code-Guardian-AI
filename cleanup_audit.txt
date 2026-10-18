@@ -1,0 +1,72 @@
+========== GIT STATUS ==========
+ M .DS_Store
+ M backend/analysis/__pycache__/project_analyzer.cpython-313.pyc
+ M backend/analysis/def_use.py
+ M backend/analysis/project_analyzer.py
+ M backend/api/__pycache__/schemas.cpython-313.pyc
+ M backend/api/routes/analysis.py
+ M backend/api/schemas.py
+ M tests/sample_project/auth.py
+ M tests/test_project_analyzer.py
+?? apply_taint_patch.py
+?? backend.zip
+?? backend/analysis/graph_dataset.py
+?? backend/analysis/graph_features.py
+?? backend/analysis/risk_labels.py
+?? backend/analysis/risk_predictor.py
+?? backend/analysis/taint_analysis.py.backup
+?? backend/analysis/taint_analysis.py.bak
+?? backend/analysis/unified_code_graph.py
+?? backend/api.zip
+?? backend/api/routes/analysis.py.backup
+?? backend/api/routes/correction.py.backup
+?? backend/api/routes/pipeline.py
+?? backend/api/routes/pipeline_run.py
+?? backend/api/routes/verified_fix.py
+?? backend/ml/
+?? backend/repository/github.py
+?? backend/services/
+?? cleanup_audit.txt
+?? data/
+?? demo_vuln/
+?? docker/
+?? project_files.txt
+?? pytest.ini
+?? tests/sample_project/tests/
+?? tests/test_dataset_collection.py
+?? tests/test_dataset_collector.py
+?? tests/test_graph_dataset.py
+?? tests/test_graph_features.py
+?? tests/test_graph_model.py
+?? tests/test_patch_verification.py
+?? tests/test_risk_labels.py
+?? tests/test_risk_predictor.py
+?? tests/test_trainer.py
+?? tests/test_unified_code_graph.py
+
+========== BACKUP FILE COMPARISON ==========
+DIFFERENT: backend/analysis/taint_analysis.py.backup
+DIFFERENT: backend/analysis/taint_analysis.py.bak
+DIFFERENT: backend/api/routes/analysis.py.backup
+MISSING FILE: backend/api/routes/correction.py.backup or backend/api/routes/correction.py
+MISSING FILE: backend/services/patch_verification.py.backup or backend/services/patch_verification.py
+
+========== DUPLICATE DOCUMENTATION ==========
+
+========== AI PROVIDER IMPORTS ==========
+
+========== MODEL CHECKPOINT REFERENCES ==========
+backend/ml/cvefixes_inference.py:20:    / "code_risk_gnn_sampled_best.pt"
+tests/test_trainer.py:337:        / "code_guardian.pt"
+
+========== PROJECT ROOT FILES ==========
+./.DS_Store
+./.gitignore
+./apply_taint_patch.py
+./backend.zip
+./cleanup_audit.txt
+./contributing.md
+./project_files.txt
+./project_structure.md
+./pytest.ini
+./readme.md

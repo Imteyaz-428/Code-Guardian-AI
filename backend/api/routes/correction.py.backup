@@ -1,0 +1,839 @@
+from __future__ import annotations
+
+import ast
+import os
+import tempfile
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from backend.api.schemas import (
+    CorrectionRequest,
+    CorrectionResponse,
+)
+from backend.core.config import settings
+from backend.repository.manager import RepositoryManager
+from backend.services.ai_correction import (
+    AICorrectionService,
+    CorrectionInput,
+)
+from backend.services.code_correction import CodeCorrectionService
+from backend.services.gemini_provider import GeminiCorrectionProvider
+from backend.services.patch_registry import patch_registry
+from backend.services.patch_verification import PatchVerificationService
+from backend.repository.github import clone_github_repository
+
+router = APIRouter(
+    prefix="/correction",
+    tags=["code-correction"],
+)
+
+code_correction_service = CodeCorrectionService()
+patch_verification_service = PatchVerificationService()
+
+
+# =========================================================
+# SCHEMAS
+# =========================================================
+
+
+class PatchVerificationRequest(BaseModel):
+    repository_path: str = Field(..., min_length=1)
+    file_path: str = Field(..., min_length=1)
+    proposed_source: str = Field(..., min_length=1)
+    run_tests: bool = True
+    timeout_seconds: int = Field(default=60, ge=5, le=180)
+
+
+class PatchVerificationResponse(BaseModel):
+    status: str
+    syntax_passed: bool
+    tests_run: bool
+    tests_passed: bool | None = None
+    duration_seconds: float
+    stdout: str = ""
+    stderr: str = ""
+    message: str = ""
+
+
+class TrackedCorrectionResponse(BaseModel):
+    proposal_id: str
+    proposal: CorrectionResponse
+    verification: PatchVerificationResponse | None = None
+    requires_human_review: bool = True
+
+
+class PatchApprovalResponse(BaseModel):
+    proposal_id: str
+    approved: bool
+    message: str
+
+
+class PatchApplyRequest(BaseModel):
+    proposal_id: str = Field(..., min_length=1)
+
+
+class PatchApplyResponse(BaseModel):
+    proposal_id: str
+    applied: bool
+    file_path: str
+    message: str
+    
+class PatchHistoryItem(BaseModel):
+    proposal_id: str
+    repository_path: str
+    file_path: str
+    verification_status: str
+    approved: bool
+    applied: bool
+    created_at: str
+
+
+class PatchHistoryResponse(BaseModel):
+    total_returned: int
+    total_matching: int
+    limit: int
+    offset: int
+    proposals: list[PatchHistoryItem]
+
+
+# =========================================================
+# PATH VALIDATION
+# =========================================================
+
+
+def _resolve_repository(repository_path: str) -> Path:
+    """Resolve a repository restricted to the configured analysis root."""
+
+    analysis_root = settings.ALLOWED_ANALYSIS_ROOT.expanduser().resolve()
+    candidate = Path(repository_path).expanduser()
+
+    if not candidate.is_absolute():
+        candidate = analysis_root / candidate
+
+    candidate = candidate.resolve()
+
+    try:
+        candidate.relative_to(analysis_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Repository path is outside the allowed analysis root.",
+        ) from exc
+
+    if not candidate.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail="Repository directory does not exist.",
+        )
+
+    try:
+        repository = RepositoryManager(str(candidate))
+        root = Path(repository.repository_path).resolve()
+    except (ValueError, OSError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid repository: {exc}",
+        ) from exc
+
+    try:
+        root.relative_to(analysis_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Repository is outside the allowed analysis root.",
+        ) from exc
+
+    return root
+
+
+def _resolve_correction_repository(
+    repository_path: str | None,
+    github_url: str | None,
+) -> tuple[Path, Path | None]:
+    """
+    Resolve a local repository or clone a public GitHub repository.
+
+    Returns:
+        (repository_root, clone_workspace)
+
+    clone_workspace is None for local repositories.
+    The caller is responsible for managing a cloned workspace's lifecycle.
+    """
+
+    if bool(repository_path) == bool(github_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of repository_path or github_url.",
+        )
+
+    if github_url:
+        try:
+            cloned_repository, clone_workspace = (
+                clone_github_repository(github_url)
+            )
+            return cloned_repository.resolve(), clone_workspace.resolve()
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to clone GitHub repository: {exc}",
+            ) from exc
+
+    return _resolve_repository(repository_path), None
+
+
+def _resolve_python_file(root: Path, file_path: str) -> Path:
+    """Resolve a relative Python path and reject unsafe symlinks."""
+
+    relative_file = Path(file_path)
+
+    if (
+        relative_file.is_absolute()
+        or ".." in relative_file.parts
+        or not relative_file.parts
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="file_path must be a safe relative path.",
+        )
+
+    if relative_file.suffix != ".py":
+        raise HTTPException(
+            status_code=400,
+            detail="Only Python files are supported.",
+        )
+
+    # Check each existing path component before resolving symlinks.
+    current = root
+
+    for part in relative_file.parts:
+        current = current / part
+
+        if current.is_symlink():
+            raise HTTPException(
+                status_code=400,
+                detail="Symlinks are not permitted in target file paths.",
+            )
+
+    target = (root / relative_file).resolve()
+
+    try:
+        target.relative_to(root.resolve())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Target file is outside the repository.",
+        ) from exc
+
+    if not target.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Target Python file was not found.",
+        )
+
+    return target
+
+
+# =========================================================
+# MERGE FUNCTION CORRECTION INTO COMPLETE FILE
+# =========================================================
+
+
+def _build_updated_file(
+    original_source: str,
+    function_name: str,
+    corrected_function: str,
+    file_path: str,
+) -> str:
+    """
+    Replace a top-level function while preserving the rest of the file.
+
+    Nested functions are rejected because identifying them safely requires
+    a qualified function identifier rather than just a function name.
+    """
+
+    try:
+        original_tree = ast.parse(original_source, filename=file_path)
+        corrected_tree = ast.parse(corrected_function, filename=file_path)
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid Python syntax: {exc}") from exc
+
+    # Only accept one matching top-level function.
+    original_matches = [
+        node
+        for node in original_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function_name
+    ]
+
+    corrected_matches = [
+        node
+        for node in corrected_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function_name
+    ]
+
+    if len(original_matches) != 1:
+        raise ValueError(
+            f"Expected exactly one top-level function named "
+            f"'{function_name}', found {len(original_matches)}."
+        )
+
+    if len(corrected_matches) != 1:
+        raise ValueError(
+            f"The corrected code must contain exactly one top-level "
+            f"function named '{function_name}'."
+        )
+
+    original_node = original_matches[0]
+    corrected_node = corrected_matches[0]
+
+    if type(original_node) is not type(corrected_node):
+        raise ValueError(
+            "The correction cannot change a synchronous function "
+            "into an asynchronous function, or vice versa."
+        )
+
+    if original_node.end_lineno is None:
+        raise ValueError("Could not determine the function's end line.")
+
+    original_lines = original_source.splitlines(keepends=True)
+    corrected_lines = corrected_function.splitlines()
+
+    start_line = original_node.lineno
+
+    if original_node.decorator_list:
+        start_line = min(
+            decorator.lineno
+            for decorator in original_node.decorator_list
+        )
+
+    end_line = original_node.end_lineno
+
+    # Extract the complete corrected function, including its decorators.
+    corrected_start = corrected_node.lineno
+
+    if corrected_node.decorator_list:
+        corrected_start = min(
+            decorator.lineno
+            for decorator in corrected_node.decorator_list
+        )
+
+    corrected_end = corrected_node.end_lineno
+
+    if corrected_end is None:
+        raise ValueError("Could not determine the corrected function's end line.")
+
+    corrected_text = "".join(
+        line + "\n"
+        for line in corrected_lines[corrected_start - 1:corrected_end]
+    ).rstrip("\n")
+
+    # Preserve decorators from the original when the correction omits them.
+    if original_node.decorator_list and not corrected_node.decorator_list:
+        decorators = [
+            original_lines[decorator.lineno - 1].rstrip("\r\n")
+            for decorator in original_node.decorator_list
+        ]
+        corrected_text = "\n".join(decorators + [corrected_text])
+
+    # Top-level functions must remain top-level.
+    updated_source = (
+        "".join(original_lines[:start_line - 1])
+        + corrected_text
+        + "\n"
+        + "".join(original_lines[end_line:])
+    )
+
+    try:
+        ast.parse(updated_source, filename=file_path)
+    except SyntaxError as exc:
+        raise ValueError(
+            f"The complete updated file is invalid: {exc}"
+        ) from exc
+
+    return updated_source
+
+
+# =========================================================
+# GENERATE CORRECTION
+# =========================================================
+
+
+@router.post(
+    "/propose",
+    response_model=CorrectionResponse,
+)
+def propose_correction(
+    request: CorrectionRequest,
+) -> CorrectionResponse:
+    """Generate a function-level correction without modifying the file."""
+
+    root, clone_workspace = _resolve_correction_repository(
+        repository_path=request.repository_path,
+        github_url=request.github_url,
+    )
+
+    relative_file = Path(request.file_path)
+
+    target_file = _resolve_python_file(
+        root,
+        relative_file.as_posix(),
+    )
+
+    try:
+        correction_request = code_correction_service.create_request(
+            file_path=target_file,
+            function_name=request.function_name,
+            finding=request.finding,
+            severity=request.severity,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        ai_service = AICorrectionService(
+            provider=GeminiCorrectionProvider(),
+        )
+
+        ai_result = ai_service.correct(
+            CorrectionInput(
+                file_path=relative_file.as_posix(),
+                function_name=request.function_name,
+                original_code=correction_request.source_code,
+                finding=request.finding,
+                severity=request.severity,
+                explanation=request.explanation,
+            )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        print(
+            f"Code correction provider failed: {type(exc).__name__}",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The AI provider could not generate a correction.",
+        ) from exc
+
+    try:
+        result = code_correction_service.create_result(
+            request=correction_request,
+            corrected_code=ai_result.corrected_code,
+            explanation=ai_result.explanation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return CorrectionResponse(
+        file_path=relative_file.as_posix(),
+        function_name=request.function_name,
+        original_code=result.original_code,
+        corrected_code=result.corrected_code,
+        explanation=result.explanation,
+        patch=result.patch or "",
+        status="proposed",
+    )
+
+
+# =========================================================
+# VERIFY SOURCE
+# =========================================================
+
+
+@router.post(
+    "/verify",
+    response_model=PatchVerificationResponse,
+)
+def verify_correction(
+    request: PatchVerificationRequest,
+) -> PatchVerificationResponse:
+    """Verify proposed complete-file source in a temporary repository copy."""
+
+    root = _resolve_repository(request.repository_path)
+    relative_file = Path(request.file_path)
+
+    _resolve_python_file(root, relative_file.as_posix())
+
+    try:
+        result = patch_verification_service.verify(
+            repository_root=root,
+            relative_file=relative_file.as_posix(),
+            proposed_source=request.proposed_source,
+            run_tests=request.run_tests,
+            timeout_seconds=request.timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return PatchVerificationResponse(**result)
+
+
+# =========================================================
+# GENERATE, MERGE, REGISTER, AND VERIFY
+# =========================================================
+
+
+@router.post(
+    "/propose-and-verify",
+    response_model=TrackedCorrectionResponse,
+)
+def propose_and_verify_correction(
+    request: CorrectionRequest,
+) -> TrackedCorrectionResponse:
+    """
+    Generate a function correction, merge it into the complete file,
+    and verify the complete updated source.
+    """
+
+    root = _resolve_repository(request.repository_path)
+    relative_file = Path(request.file_path)
+
+    target_file = _resolve_python_file(
+        root,
+        relative_file.as_posix(),
+    )
+
+    try:
+        original_source = target_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read the original source file.",
+        ) from exc
+
+    original_hash = patch_registry.hash_source(original_source)
+
+    proposal = propose_correction(request)
+
+    # Do not register a proposal if the source changed during AI generation.
+    try:
+        latest_source = target_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to reread the original source file.",
+        ) from exc
+
+    if patch_registry.hash_source(latest_source) != original_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="The source changed during generation. Generate a new proposal.",
+        )
+
+    if proposal.original_code not in original_source:
+        raise HTTPException(
+            status_code=409,
+            detail="The proposed function does not match the original file.",
+        )
+
+    try:
+        proposed_full_source = _build_updated_file(
+            original_source=original_source,
+            function_name=request.function_name,
+            corrected_function=proposal.corrected_code,
+            file_path=relative_file.as_posix(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Recheck immediately before registering.
+    try:
+        latest_source = target_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to reread the original source file.",
+        ) from exc
+
+    if patch_registry.hash_source(latest_source) != original_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="The source changed before verification. Generate a new proposal.",
+        )
+
+    tracked = patch_registry.register(
+        repository_path=str(root),
+        file_path=relative_file.as_posix(),
+        original_source=original_source,
+        proposed_source=proposed_full_source,
+    )
+
+    try:
+        verification_result = patch_verification_service.verify(
+            repository_root=root,
+            relative_file=relative_file.as_posix(),
+            proposed_source=proposed_full_source,
+            run_tests=True,
+            timeout_seconds=60,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    patch_registry.mark_verified(
+        tracked.proposal_id,
+        verification_result["status"],
+    )
+
+    return TrackedCorrectionResponse(
+        proposal_id=tracked.proposal_id,
+        proposal=proposal,
+        verification=PatchVerificationResponse(**verification_result),
+        requires_human_review=True,
+    )
+
+
+# =========================================================
+# APPROVAL
+# =========================================================
+
+
+@router.post(
+    "/{proposal_id}/approve",
+    response_model=PatchApprovalResponse,
+)
+def approve_patch(
+    proposal_id: str,
+) -> PatchApprovalResponse:
+    """Approve a successfully verified patch without applying it."""
+
+    try:
+        proposal = patch_registry.approve(proposal_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Patch proposal not found or expired.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return PatchApprovalResponse(
+        proposal_id=proposal.proposal_id,
+        approved=True,
+        message="Patch approved. It has not been applied yet.",
+    )
+
+
+# =========================================================
+# APPLY APPROVED PATCH
+# =========================================================
+
+
+@router.post(
+    "/apply",
+    response_model=PatchApplyResponse,
+)
+def apply_patch(
+    request: PatchApplyRequest,
+) -> PatchApplyResponse:
+    """
+    Apply a verified, human-approved complete-file correction.
+
+    Note: this is not a secure OS-level sandbox or a complete
+    concurrency-control mechanism.
+    """
+
+    tracked = patch_registry.get(request.proposal_id)
+
+    if tracked is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patch proposal not found or expired.",
+        )
+
+    if tracked.verification_status != "verified":
+        raise HTTPException(
+            status_code=409,
+            detail="Patch has not passed verification.",
+        )
+
+    if not tracked.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="Human approval is required before applying the patch.",
+        )
+
+    if tracked.applied:
+        raise HTTPException(
+            status_code=409,
+            detail="This patch has already been applied.",
+        )
+
+    root = _resolve_repository(tracked.repository_path)
+    target = _resolve_python_file(root, tracked.file_path)
+
+    if str(root) != str(Path(tracked.repository_path).resolve()):
+        raise HTTPException(
+            status_code=409,
+            detail="The registered repository path has changed.",
+        )
+
+    if (
+        patch_registry.hash_source(tracked.proposed_source)
+        != tracked.proposed_hash
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The registered proposal failed its integrity check.",
+        )
+
+    try:
+        ast.parse(tracked.proposed_source, filename=tracked.file_path)
+    except SyntaxError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The proposed source failed syntax validation.",
+        ) from exc
+
+    try:
+        original_bytes = target.read_bytes()
+        original_source = original_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read the target file safely.",
+        ) from exc
+
+    if patch_registry.hash_source(original_source) != tracked.original_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="The original file changed. Generate a new proposal.",
+        )
+
+    temp_name: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_name = temp_file.name
+            temp_file.write(tracked.proposed_source.encode("utf-8"))
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        # Recheck before replacement.
+        latest_source = target.read_text(encoding="utf-8")
+
+        if patch_registry.hash_source(latest_source) != tracked.original_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="The original file changed during patch application.",
+            )
+
+        os.chmod(temp_name, target.stat().st_mode)
+        os.replace(temp_name, target)
+        temp_name = None
+
+        patch_registry.mark_applied(request.proposal_id)
+
+    except HTTPException:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Patch application failed.",
+        ) from exc
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+    return PatchApplyResponse(
+        proposal_id=tracked.proposal_id,
+        applied=True,
+        file_path=tracked.file_path,
+        message="Approved patch applied successfully.",
+    )
+    
+# =========================================================
+# PATCH HISTORY
+# =========================================================
+
+@router.get(
+    "/history",
+    response_model=PatchHistoryResponse,
+)
+def get_patch_history(
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    approved: bool | None = None,
+    applied: bool | None = None,
+) -> PatchHistoryResponse:
+    """Return filtered patch history with pagination."""
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="limit must be between 1 and 500.",
+        )
+
+    if offset < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="offset cannot be negative.",
+        )
+
+    try:
+        proposals = patch_registry.list_proposals(
+            limit=limit,
+            offset=offset,
+            status=status,
+            approved=approved,
+            applied=applied,
+        )
+
+        total = patch_registry.count_proposals(
+            status=status,
+            approved=approved,
+            applied=applied,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    items = [
+        PatchHistoryItem(
+            proposal_id=proposal.proposal_id,
+            repository_path=proposal.repository_path,
+            file_path=proposal.file_path,
+            verification_status=proposal.verification_status,
+            approved=proposal.approved,
+            applied=proposal.applied,
+            created_at=proposal.created_at,
+        )
+        for proposal in proposals
+    ]
+
+    return PatchHistoryResponse(
+        total_returned=len(items),
+        total_matching=total,
+        limit=limit,
+        offset=offset,
+        proposals=items,
+    )

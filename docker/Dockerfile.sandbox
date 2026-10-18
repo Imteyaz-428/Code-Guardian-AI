@@ -1,0 +1,24 @@
+# Code Guardian sandbox image
+# Build from the project root (folder that contains backend/):
+#   docker build -f docker/Dockerfile.sandbox -t code-guardian-sandbox:latest .
+#
+# Sandbox runs with --network none, so anything the target repo needs at
+# import/test time must be installed HERE, e.g.:
+#   docker build -f docker/Dockerfile.sandbox \
+#     --build-arg EXTRA_PIP="fastapi sqlalchemy requests" \
+#     -t code-guardian-sandbox:latest .
+
+FROM python:3.12-slim
+
+ARG EXTRA_PIP=""
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN pip install --no-cache-dir pytest ${EXTRA_PIP}
+USER 65534:65534
+
+# DockerSandbox.run() mounts the workspace at /src (read-only), copies it to
+# /tmp/work and runs as 65534:65534 -- nothing else is needed in the image.
+WORKDIR /tmp
