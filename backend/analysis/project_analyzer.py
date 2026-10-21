@@ -92,10 +92,13 @@ class ProjectAnalyzer:
     def __init__(
         self,
         repository_path: str | Path,
+        generate_labels: bool = True,
     ):
         self.repository_manager = RepositoryManager(
             repository_path
         )
+
+        self.generate_labels = generate_labels
 
         self.errors: list[str] = []
 
@@ -419,9 +422,10 @@ class ProjectAnalyzer:
         # Static Risk Labels
         # =====================================================
 
-        self.risk_labels = (
-            self.generate_risk_labels()
-        )
+        if self.generate_labels:
+            self.risk_labels = self.generate_risk_labels()
+        else:
+            self.risk_labels = None
 
         return results
 
@@ -923,6 +927,9 @@ class ProjectAnalyzer:
 
         self.unified_code_graph = (
             builder.graph
+        )
+        self.unified_code_graph.repository_root = (
+            self.repository_manager.repository_path
         )
 
     # =========================================================

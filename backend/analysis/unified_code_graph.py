@@ -183,12 +183,9 @@ class UnifiedCodeGraph:
     """
 
     def __init__(self) -> None:
-
         self.nodes: dict[str, CodeGraphNode] = {}
-
         self.edges: list[CodeGraphEdge] = []
 
-        # Fast duplicate detection.
         self._edge_keys: set[
             tuple[
                 str,
@@ -198,12 +195,22 @@ class UnifiedCodeGraph:
             ]
         ] = set()
 
+        # Fast adjacency indexes.
+        self._outgoing_edges: dict[
+            str, list[CodeGraphEdge]
+        ] = {}
+
+        self._incoming_edges: dict[
+            str, list[CodeGraphEdge]
+        ] = {}
+
     # --------------------------------------------------------
     # Nodes
     # --------------------------------------------------------
 
     def add_node(
         self,
+        
         node_id: str,
         node_type: str,
         name: str | None = None,
@@ -250,6 +257,8 @@ class UnifiedCodeGraph:
         )
 
         self.nodes[node_id] = node
+        self._outgoing_edges.setdefault(node_id, [])
+        self._incoming_edges.setdefault(node_id, [])
 
         return node
 
@@ -264,24 +273,15 @@ class UnifiedCodeGraph:
         edge_type: CodeGraphEdgeType | str,
         metadata: dict[str, Any] | None = None,
     ) -> CodeGraphEdge:
-        """
-        Add an edge.
-
-        Duplicate edges are ignored.
-        """
+        """Add an edge and update adjacency indexes efficiently."""
 
         if source not in self.nodes:
-            raise ValueError(
-                f"Source node does not exist: {source}"
-            )
+            raise ValueError(f"Source node does not exist: {source}")
 
         if target not in self.nodes:
-            raise ValueError(
-                f"Target node does not exist: {target}"
-            )
+            raise ValueError(f"Target node does not exist: {target}")
 
         if isinstance(edge_type, str):
-
             edge_type = CodeGraphEdgeType(edge_type)
 
         metadata_tuple = tuple(
@@ -298,13 +298,11 @@ class UnifiedCodeGraph:
             metadata_tuple,
         )
 
+        # Return an existing edge without scanning the complete graph.
         if key in self._edge_keys:
-
-            for edge in self.edges:
-
+            for edge in self._outgoing_edges.get(source, []):
                 if (
-                    edge.source == source
-                    and edge.target == target
+                    edge.target == target
                     and edge.edge_type == edge_type
                     and edge.metadata == metadata_tuple
                 ):
@@ -318,11 +316,12 @@ class UnifiedCodeGraph:
         )
 
         self.edges.append(edge)
-
         self._edge_keys.add(key)
 
-        return edge
+        self._outgoing_edges.setdefault(source, []).append(edge)
+        self._incoming_edges.setdefault(target, []).append(edge)
 
+        return edge
     # --------------------------------------------------------
     # Queries
     # --------------------------------------------------------
@@ -341,29 +340,17 @@ class UnifiedCodeGraph:
         self,
         node_id: str,
     ) -> list[CodeGraphEdge]:
-        """
-        Return outgoing edges.
-        """
+        """Return outgoing edges using the adjacency index."""
 
-        return [
-            edge
-            for edge in self.edges
-            if edge.source == node_id
-        ]
+        return self._outgoing_edges.get(node_id, [])
 
     def get_edges_to(
         self,
         node_id: str,
     ) -> list[CodeGraphEdge]:
-        """
-        Return incoming edges.
-        """
+        """Return incoming edges using the adjacency index."""
 
-        return [
-            edge
-            for edge in self.edges
-            if edge.target == node_id
-        ]
+        return self._incoming_edges.get(node_id, [])
 
     def get_edges_by_type(
         self,
@@ -1949,9 +1936,10 @@ class UnifiedCodeGraphBuilder:
                     "variable": variable,
                     "definition_id": definition_id,
                     "use_id": use_id,
-                    "path": list(path)
+                    # tuple (not list): metadata becomes part of a set key
+                    "path": tuple(path)
                     if path
-                    else [],
+                    else (),
                 }
 
                 if reason:

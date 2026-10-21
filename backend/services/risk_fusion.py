@@ -131,7 +131,23 @@ def attribute_vulnerabilities(
     unattributed = 0
 
     for v in vulns:
+        # The taint engine now records the exact function (file::name) that
+        # contains the sink, so use it when it is a known function.
+        direct = getattr(v, "function_id", "")
+        if direct and direct in functions:
+            by_function[direct].append({
+                "rule_id": v.rule_id,
+                "name": v.name,
+                "severity": str(v.severity).upper(),
+                "source": f"{v.source_name} (line {v.source_line})",
+                "sink": f"{v.sink_name} (line {v.sink_line})",
+                "variable": v.variable,
+                "description": v.description,
+            })
+            continue
+
         best: tuple[int, int, str] | None = None  # (-has_variable, span, id)
+        sink_short = str(v.sink_name).split(".")[-1]
 
         for function_id, node in functions.items():
             start = getattr(node, "lineno", None)
@@ -147,7 +163,7 @@ def attribute_vulnerabilities(
 
             if not (0 < v.sink_line <= len(source)):
                 continue
-            if v.sink_name not in source[v.sink_line - 1]:
+            if sink_short not in source[v.sink_line - 1]:
                 continue
 
             # Prefer the function whose sink line also mentions the tainted

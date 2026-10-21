@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import ast
 import shutil
 from pathlib import Path
@@ -276,3 +277,71 @@ def fix_verified(request: VerifiedFixRequest) -> VerifiedFixResponse:
     finally:
         if clone_workspace is not None and not registered:
             shutil.rmtree(clone_workspace, ignore_errors=True)
+            
+            
+            
+# ---------------------------------------------------------
+# AI Code Correction Schemas
+# ---------------------------------------------------------
+
+class CorrectionRequest(BaseModel):
+    repository_path: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Local repository path within the configured analysis root."
+        ),
+    )
+
+    github_url: str | None = Field(
+        default=None,
+        min_length=1,
+        description="HTTPS URL of a public GitHub repository.",
+    )
+
+    file_path: str = Field(
+        ...,
+        min_length=1,
+        description="Python file path relative to the repository root.",
+    )
+
+    function_name: str = Field(
+        ...,
+        min_length=1,
+        description="Name of the function to correct.",
+    )
+
+    finding: str = Field(
+        ...,
+        min_length=1,
+        description="Description of the finding to address.",
+    )
+
+    severity: str = Field(
+        default="medium",
+        description="Finding severity.",
+    )
+
+    explanation: str = Field(
+        default="",
+        description="Additional context from static analysis.",
+    )
+
+    @model_validator(mode="after")
+    def validate_repository_source(self):
+        if bool(self.repository_path) == bool(self.github_url):
+            raise ValueError(
+                "Provide exactly one of repository_path or github_url."
+            )
+
+        return self
+
+
+class CorrectionResponse(BaseModel):
+    file_path: str
+    function_name: str
+    original_code: str
+    corrected_code: str
+    explanation: str
+    patch: str
+    status: str = "proposed"

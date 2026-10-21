@@ -22,7 +22,7 @@ _SUMMARY = re.compile(r"\b\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed
 _SMOKE = (
     "import importlib, sys\n"
     "try:\n    importlib.import_module(sys.argv[1])\n"
-    "except BaseException as e:\n    print('IMPORT_ERROR:', type(e).__name__); sys.exit(3)\n"
+    "except BaseException as e:\n    print('IMPORT_ERROR:', type(e).__name__, str(e)); sys.exit(3)\n"
     "print('IMPORT_OK')\n"
 )
 

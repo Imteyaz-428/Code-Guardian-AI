@@ -19,7 +19,7 @@ from backend.services.ai_correction import (
     CorrectionInput,
 )
 from backend.services.code_correction import CodeCorrectionService
-from backend.services.gemini_provider import GeminiCorrectionProvider
+from backend.services.ai_correction_provider import FallbackCorrectionProvider
 from backend.services.patch_registry import patch_registry
 from backend.services.patch_verification import PatchVerificationService
 from backend.repository.github import clone_github_repository
@@ -403,7 +403,7 @@ def propose_correction(
 
     try:
         ai_service = AICorrectionService(
-            provider=GeminiCorrectionProvider(),
+            provider=FallbackCorrectionProvider(),
         )
 
         ai_result = ai_service.correct(
@@ -499,6 +499,15 @@ def propose_and_verify_correction(
     Generate a function correction, merge it into the complete file,
     and verify the complete updated source.
     """
+
+    if not request.repository_path:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "propose-and-verify currently requires repository_path "
+                "inside the configured analysis root."
+            ),
+        )
 
     root = _resolve_repository(request.repository_path)
     relative_file = Path(request.file_path)

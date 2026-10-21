@@ -27,6 +27,7 @@ import ast
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from backend.analysis import taint_catalog as catalog
 from backend.analysis.data_flow import DataFlowResult
 from backend.analysis.def_use import DefUseResult
 from backend.analysis.vulnerability_rules import (
@@ -125,6 +126,11 @@ class TaintFlowFinding:
         "to a sensitive sink."
     )
 
+    # Where the sink physically is (set by the project-level engine).
+    file: str = ""
+    function: str = ""
+    function_id: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source_name": self.source_name,
@@ -136,6 +142,9 @@ class TaintFlowFinding:
             "use_id": self.use_id,
             "path": list(self.path),
             "reason": self.reason,
+            "file": self.file,
+            "function": self.function,
+            "function_id": self.function_id,
         }
 
 
@@ -219,6 +228,9 @@ class TaintAnalysisResult:
 class _TaintOrigin:
     source_name: str
     source_line: int
+    # Rule ids this value is already safe for (e.g. Path(x).suffix cannot
+    # contain "../", so it is neutralised for PATH_TRAVERSAL only).
+    neutralized: frozenset = frozenset()
 
 
 # ================================================================
@@ -258,6 +270,12 @@ class TaintAnalyzer:
         "sanitize_sql",
         "sanitize_html",
         "quote",
+        "quote_plus",
+        "int",
+        "float",
+        "bool",
+        "clean",
+        "escape_string",
     }
 
     DEFAULT_SINK_NAMES = {
@@ -275,6 +293,14 @@ class TaintAnalyzer:
             if vulnerability_engine is not None
             else VulnerabilityRuleEngine()
         )
+        self._use_catalog_sinks = True
+        self._node_ids: dict[int, str] = {}
+        self._function_stack: list[str] = []
+        self._node_stack: list[int] = []
+        self._argv_frames: list[set[str]] = []
+        self._return_shapes: dict[int, tuple] = {}
+        self._return_cache: dict[tuple, tuple] = {}
+        self._sink_names: set[str] = set()
 
     # ============================================================
     # FUNCTION-LEVEL ANALYSIS
@@ -417,6 +443,19 @@ class TaintAnalyzer:
             function_name="<project>"
         )
 
+        # Catalog sinks apply unless the caller supplied its own sink names.
+        self._use_catalog_sinks = sink_names is None
+        self._node_ids = {
+            id(function_node): function_id
+            for function_id, function_node in functions.items()
+        }
+        self._function_stack = []
+        self._node_stack = []
+        self._argv_frames = []
+        self._return_shapes = {}
+        self._return_cache = {}
+        self._sink_names = sinks
+
         function_by_name: dict[
             str,
             ast.FunctionDef | ast.AsyncFunctionDef,
@@ -476,11 +515,18 @@ class TaintAnalyzer:
         # Analyze project flows.
         # --------------------------------------------------------
 
-        for function_name, function_node in (
-            function_by_name.items()
-        ):
+        # Every function is analysed (same-named functions in different
+        # files included). Route-handler parameters are attacker-controlled.
+        for function_id, function_node in functions.items():
 
             state: dict[str, _TaintOrigin] = {}
+
+            if catalog.is_route_handler(function_node):
+                for parameter in catalog.route_parameters(function_node):
+                    state[parameter] = _TaintOrigin(
+                        source_name="route_parameter",
+                        source_line=getattr(function_node, "lineno", 0),
+                    )
 
             self._execute_interprocedural(
                 function_node=function_node,
@@ -492,6 +538,8 @@ class TaintAnalyzer:
                 result=combined,
                 summaries=summaries,
             )
+
+        self._dedupe(combined)
 
         return combined
 
@@ -859,76 +907,114 @@ class TaintAnalyzer:
         source_names: set[str],
         sanitizer_names: set[str],
     ) -> Optional[_TaintOrigin]:
-        # Direct variable.
+        """
+        Determine whether an expression contains tainted data.
+
+        Recognizes configured sources and common framework request
+        inputs while ensuring sanitizer calls stop taint propagation.
+        """
+
+        # Direct variable reference.
         if isinstance(node, ast.Name):
             return tainted.get(node.id)
 
-        # Sanitizer call removes taint.
-           # Call expression.
-        if isinstance(node, ast.Call):
-            # Direct source call.
-            call_name = self._call_name(node)
+        # request.args["x"], request.form, sys.argv[1], ...
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            attribute_source = catalog.expression_source(node)
 
-            if call_name in source_names:
+            if attribute_source is not None:
                 return _TaintOrigin(
-                    source_name=call_name,
+                    source_name=attribute_source,
                     source_line=getattr(node, "lineno", 0),
                 )
 
-            # Sanitizer call removes taint.
+        if isinstance(node, ast.Attribute) and node.attr in self.PATH_NEUTRAL_ATTRS:
+            return self._neutralize(
+                self._expression_taint(
+                    node.value, tainted, source_names, sanitizer_names,
+                ),
+                "PATH_TRAVERSAL",
+            )
+
+        # Handle function and method calls.
+        if isinstance(node, ast.Call):
+            call_name = self._call_name(node)
+
+            # A sanitizer must stop propagation before its arguments
+            # are inspected.
             if call_name in sanitizer_names:
                 return None
 
-            # Propagate taint through normal call arguments.
-            for arg in node.args:
-                arg_origin = self._expression_taint(
-                    arg,
+            if call_name in self.PATH_NEUTRAL_CALLS:
+                return self._neutralize(
+                    self._pick(
+                        self._expression_taint(a, tainted, source_names, sanitizer_names)
+                        for a in node.args
+                    ),
+                    "PATH_TRAVERSAL",
+                )
+
+            # Recognize direct sources and framework request inputs.
+            source_name = self._source_name_for_call(
+                node,
+                source_names,
+            )
+
+            if source_name is not None:
+                return _TaintOrigin(
+                    source_name=source_name,
+                    source_line=getattr(node, "lineno", 0),
+                )
+
+            # Propagate taint through arguments of ordinary calls.
+            for argument in node.args:
+                origin = self._expression_taint(
+                    argument,
                     tainted,
                     source_names,
                     sanitizer_names,
                 )
 
-                if arg_origin is not None:
-                    return arg_origin
+                if origin is not None:
+                    return origin
 
-            # Propagate taint through method calls.
-            #
-            # Examples:
-            #   user_input.strip()
-            #   user_input.lower()
-            #   user_input.encode()
-            #
-            # The tainted value is the method receiver:
-            #   user_input
-            #
-            # which is stored in node.func.value.
+            # Propagate taint through method receivers, such as
+            # username.strip() or username.lower().
             if isinstance(node.func, ast.Attribute):
-                receiver_origin = self._expression_taint(
+                origin = self._expression_taint(
                     node.func.value,
                     tainted,
                     source_names,
                     sanitizer_names,
                 )
 
-                if receiver_origin is not None:
-                    return receiver_origin
+                if origin is not None:
+                    return origin
+
+            for keyword in node.keywords:
+                origin = self._expression_taint(
+                    keyword.value,
+                    tainted,
+                    source_names,
+                    sanitizer_names,
+                )
+
+                if origin is not None:
+                    return origin
 
             return None
-        # Recursively inspect expressions.
-        for child in ast.iter_child_nodes(node):
 
-            origin = self._expression_taint(
+        # Inspect compound expressions, including concatenation,
+        # formatted strings, and binary operations.
+        return self._pick(
+            self._expression_taint(
                 child,
                 tainted,
                 source_names,
                 sanitizer_names,
             )
-
-            if origin is not None:
-                return origin
-
-        return None
-
+            for child in ast.iter_child_nodes(node)
+        )
     # ============================================================
     # SOURCE
     # ============================================================
@@ -938,22 +1024,22 @@ class TaintAnalyzer:
         node: ast.AST,
         source_names: set[str],
     ) -> Optional[_TaintOrigin]:
+        """Resolve direct and framework-specific taint sources."""
 
         if not isinstance(node, ast.Call):
             return None
 
-        name = TaintAnalyzer._call_name(node)
+        name = TaintAnalyzer._source_name_for_call(
+            node,
+            source_names,
+        )
 
-        if name not in source_names:
+        if name is None:
             return None
 
         return _TaintOrigin(
             source_name=name,
-            source_line=getattr(
-                node,
-                "lineno",
-                0,
-            ),
+            source_line=getattr(node, "lineno", 0),
         )
 
     # ============================================================
@@ -996,6 +1082,15 @@ class TaintAnalyzer:
                     origin,
                     tainted,
                 )
+
+            return
+
+        # data["key"] = tainted  /  obj.attr = tainted  -> container is tainted
+        if isinstance(target, (ast.Subscript, ast.Attribute)) and origin is not None:
+            root, _ = catalog._chain(target)
+
+            if root is not None:
+                tainted.setdefault(root, origin)
 
     # ============================================================
     # SINK DETECTION
@@ -1137,135 +1232,449 @@ class TaintAnalyzer:
             function_node.name,
         )
 
+        function_id = self._node_ids.get(id(function_node))
+
+        if function_id:
+            self._function_stack.append(function_id)
+
+        self._node_stack.append(id(function_node))
+        self._argv_frames.append(set())
+
+        try:
+            return self._exec_block(
+                function_node.body,
+                tainted,
+                function_by_name,
+                source_names,
+                sanitizer_names,
+                sink_names,
+                result,
+                summaries,
+                current_stack,
+            )
+        finally:
+            self._argv_frames.pop()
+            self._node_stack.pop()
+
+            if function_id:
+                self._function_stack.pop()
+
+    # ------------------------------------------------------------
+    # Return-value summaries (symbolic execution of the callee)
+    # ------------------------------------------------------------
+
+    def _note_return(self, value, origin, taint_of) -> None:
+        if not self._node_stack:
+            return
+
+        node_id = self._node_stack[-1]
+        scalar, elements = self._return_shapes.get(node_id, (None, None))
+
+        if scalar is None and origin is not None:
+            scalar = origin
+
+        if isinstance(value, ast.Tuple):
+            current = [taint_of(element) for element in value.elts]
+
+            if elements is None or len(elements) != len(current):
+                elements = current
+            else:
+                elements = [
+                    first if first is not None else second
+                    for first, second in zip(elements, current)
+                ]
+
+        self._return_shapes[node_id] = (scalar, elements)
+
+    def _map_call_arguments(
+        self,
+        call: ast.Call,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        tainted: dict[str, _TaintOrigin],
+        function_by_name,
+        source_names,
+        sanitizer_names,
+        summaries,
+        call_stack,
+    ) -> dict[str, _TaintOrigin]:
+        """Taint state of the callee's parameters for this call."""
+
+        parameters = [
+            argument.arg
+            for argument in (*callee.args.posonlyargs, *callee.args.args)
+        ]
+
+        offset = (
+            1
+            if (
+                isinstance(call.func, ast.Attribute)
+                and parameters
+                and parameters[0] in {"self", "cls"}
+            )
+            else 0
+        )
+
+        mapped: list[tuple[str, ast.AST]] = []
+
+        for index, argument in enumerate(call.args):
+            if index + offset >= len(parameters):
+                break
+
+            mapped.append((parameters[index + offset], argument))
+
+        keyword_parameters = {
+            *parameters,
+            *(argument.arg for argument in callee.args.kwonlyargs),
+        }
+
+        for keyword in call.keywords:
+            if keyword.arg in keyword_parameters:
+                mapped.append((keyword.arg, keyword.value))
+
+        state: dict[str, _TaintOrigin] = {}
+
+        for parameter, argument in mapped:
+            origin = self._expression_taint_interprocedural(
+                argument, tainted, function_by_name, source_names,
+                sanitizer_names, summaries, call_stack,
+            )
+
+            if origin is not None:
+                state[parameter] = origin
+
+        return state
+
+    def _call_return_shape(
+        self,
+        call: ast.Call,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        tainted: dict[str, _TaintOrigin],
+        function_by_name,
+        source_names,
+        sanitizer_names,
+        summaries,
+        call_stack,
+    ) -> tuple:
+        """(scalar origin, per-element origins) of what `callee` returns."""
+
+        state = self._map_call_arguments(
+            call, callee, tainted, function_by_name, source_names,
+            sanitizer_names, summaries, call_stack,
+        )
+
+        key = (
+            id(callee),
+            tuple(sorted(
+                (
+                    name,
+                    origin.source_name,
+                    origin.source_line,
+                    tuple(sorted(origin.neutralized)),
+                )
+                for name, origin in state.items()
+            )),
+        )
+
+        if key in self._return_cache:
+            return self._return_cache[key]
+
+        self._return_cache[key] = (None, None)  # breaks recursion cycles
+        self._return_shapes.pop(id(callee), None)
+
+        self._execute_interprocedural(
+            function_node=callee,
+            tainted=dict(state),
+            function_by_name=function_by_name,
+            source_names=source_names,
+            sanitizer_names=sanitizer_names,
+            sink_names=self._sink_names,
+            result=TaintAnalysisResult(function_name="<summary>"),
+            summaries=summaries,
+            call_stack=call_stack,
+        )
+
+        shape = self._return_shapes.pop(id(callee), (None, None))
+        self._return_cache[key] = shape
+
+        return shape
+
+    PATH_NEUTRAL_CALLS = frozenset({"basename", "secure_filename", "get_valid_filename"})
+    PATH_NEUTRAL_ATTRS = frozenset({"suffix", "suffixes", "stem"})
+
+    @staticmethod
+    def _neutralize(origin, *rule_ids):
+        if origin is None:
+            return None
+
+        return _TaintOrigin(
+            source_name=origin.source_name,
+            source_line=origin.source_line,
+            neutralized=origin.neutralized | frozenset(rule_ids),
+        )
+
+    @staticmethod
+    def _pick(origins):
+        """First fully-tainted origin, else the first neutralised one."""
+
+        fallback = None
+
+        for origin in origins:
+            if origin is None:
+                continue
+
+            if not origin.neutralized:
+                return origin
+
+            if fallback is None:
+                fallback = origin
+
+        return fallback
+
+    def _value_elements(
+        self,
+        value: ast.AST,
+        tainted,
+        function_by_name,
+        source_names,
+        sanitizer_names,
+        summaries,
+        call_stack,
+        taint_of,
+    ):
+        """Per-element taint of a tuple literal or a call returning a tuple."""
+
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return [taint_of(element) for element in value.elts]
+
+        if isinstance(value, ast.Call):
+            callee = self._resolve_callee(value, function_by_name)
+
+            if callee is not None and callee.name not in call_stack:
+                _, elements = self._call_return_shape(
+                    value, callee, tainted, function_by_name, source_names,
+                    sanitizer_names, summaries, call_stack,
+                )
+
+                return elements
+
+        return None
+
+    def _resolve_callee(self, call: ast.Call, function_by_name):
+        """Project function a call refers to (None for library calls)."""
+
+        callee = function_by_name.get(self._call_name(call))
+
+        if callee is None:
+            return None
+
+        if isinstance(call.func, ast.Attribute):
+            root, _ = catalog._chain(call.func.value)
+
+            if root in catalog.EXTERNAL_MODULES:
+                return None
+
+        return callee
+
+    _MUTATORS = frozenset({
+        "append", "extend", "add", "insert", "update", "setdefault", "appendleft",
+    })
+
+    def _exec_block(
+        self,
+        statements: list[ast.stmt],
+        tainted: dict[str, _TaintOrigin],
+        function_by_name: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+        source_names: set[str],
+        sanitizer_names: set[str],
+        sink_names: set[str],
+        result: TaintAnalysisResult,
+        summaries: dict[str, bool],
+        call_stack: tuple[str, ...],
+    ) -> Optional[_TaintOrigin]:
+        """Walk every statement kind (if/for/while/with/try/match included)."""
+
         return_origin: Optional[_TaintOrigin] = None
 
-        for statement in function_node.body:
+        def taint_of(expression):
+            return self._expression_taint_interprocedural(
+                expression, tainted, function_by_name, source_names,
+                sanitizer_names, summaries, call_stack,
+            )
 
-            # ----------------------------------------------------
-            # RETURN
-            # ----------------------------------------------------
-
-            if isinstance(
-                statement,
-                ast.Return,
-            ):
-
-                if statement.value is None:
-                    return return_origin
-
-                return_origin = self._expression_taint_interprocedural(
-                    statement.value,
-                    tainted,
-                    function_by_name,
-                    source_names,
-                    sanitizer_names,
-                    summaries,
-                    current_stack,
+        def check(expression):
+            if expression is not None:
+                self._check_interprocedural_sinks(
+                    expression, tainted, function_by_name, source_names,
+                    sanitizer_names, sink_names, result, summaries, call_stack,
                 )
 
-                continue
+        def run(block, state):
+            return self._exec_block(
+                block, state, function_by_name, source_names, sanitizer_names,
+                sink_names, result, summaries, call_stack,
+            )
 
-            # ----------------------------------------------------
-            # ASSIGNMENT
-            # ----------------------------------------------------
+        def branch(block):
+            state = dict(tainted)
+            returned = run(block, state)
+            return state, returned
 
-            if isinstance(
-                statement,
-                ast.Assign,
-            ):
+        def merge(*states):
+            for state in states:
+                for name, origin in state.items():
+                    tainted.setdefault(name, origin)
 
-                origin = self._expression_taint_interprocedural(
-                    statement.value,
-                    tainted,
-                    function_by_name,
-                    source_names,
-                    sanitizer_names,
-                    summaries,
-                    current_stack,
+        for statement in statements:
+
+            if isinstance(statement, ast.Return):
+                if statement.value is not None:
+                    check(statement.value)
+                    origin = taint_of(statement.value)
+                    self._note_return(statement.value, origin, taint_of)
+                    if origin is not None:
+                        return_origin = origin
+                break
+
+            if isinstance(statement, ast.Assign):
+                check(statement.value)
+                origin = taint_of(statement.value)
+                elements = self._value_elements(
+                    statement.value, tainted, function_by_name, source_names,
+                    sanitizer_names, summaries, call_stack, taint_of,
                 )
-
                 for target in statement.targets:
+                    if (
+                        elements is not None
+                        and isinstance(target, (ast.Tuple, ast.List))
+                        and len(target.elts) == len(elements)
+                        and not any(isinstance(t, ast.Starred) for t in target.elts)
+                    ):
+                        for sub_target, sub_origin in zip(target.elts, elements):
+                            self._assign_taint(sub_target, sub_origin, tainted)
+                    else:
+                        self._assign_taint(target, origin, tainted)
+
+                    if isinstance(target, ast.Name) and self._argv_frames:
+                        argv = catalog.argv_list(statement.value)
+
+                        if argv:
+                            self._argv_frames[-1].add(target.id)
+                        else:
+                            self._argv_frames[-1].discard(target.id)
+                continue
+
+            if isinstance(statement, ast.AnnAssign):
+                if statement.value is not None:
+                    check(statement.value)
                     self._assign_taint(
-                        target,
-                        origin,
-                        tainted,
+                        statement.target, taint_of(statement.value), tainted,
                     )
-
-                self._check_interprocedural_sinks(
-                    statement.value,
-                    tainted,
-                    function_by_name,
-                    source_names,
-                    sanitizer_names,
-                    sink_names,
-                    result,
-                    summaries,
-                    current_stack,
-                )
-
                 continue
 
-            # ----------------------------------------------------
-            # EXPRESSION / CALL
-            # ----------------------------------------------------
-
-            if isinstance(
-                statement,
-                ast.Expr,
-            ):
-
-                self._check_interprocedural_sinks(
-                    statement.value,
-                    tainted,
-                    function_by_name,
-                    source_names,
-                    sanitizer_names,
-                    sink_names,
-                    result,
-                    summaries,
-                    current_stack,
+            if isinstance(statement, ast.AugAssign):
+                check(statement.value)
+                existing = (
+                    tainted.get(statement.target.id)
+                    if isinstance(statement.target, ast.Name) else None
                 )
-
+                origin = existing if existing is not None else taint_of(statement.value)
+                self._assign_taint(statement.target, origin, tainted)
                 continue
 
-            # ----------------------------------------------------
-            # IF
-            # ----------------------------------------------------
+            if isinstance(statement, ast.Expr):
+                check(statement.value)
+                call = statement.value
+                if isinstance(call, ast.Await):
+                    call = call.value
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in self._MUTATORS
+                ):
+                    root, _ = catalog._chain(call.func.value)
+                    if root is not None:
+                        for argument in call.args:
+                            origin = taint_of(argument)
+                            if origin is not None:
+                                tainted.setdefault(root, origin)
+                continue
 
-            if isinstance(
-                statement,
-                ast.If,
-            ):
+            if isinstance(statement, ast.If):
+                check(statement.test)
+                body_state, body_ret = branch(statement.body)
+                else_state, else_ret = branch(statement.orelse)
+                merge(body_state, else_state)
+                for returned in (body_ret, else_ret):
+                    if returned is not None:
+                        return_origin = returned
+                continue
 
-                self._execute_interprocedural(
-                    function_node=self._temporary_block_function(
-                        function_node,
-                        statement.body,
-                    ),
-                    tainted=tainted,
-                    function_by_name=function_by_name,
-                    source_names=source_names,
-                    sanitizer_names=sanitizer_names,
-                    sink_names=sink_names,
-                    result=result,
-                    summaries=summaries,
-                    call_stack=current_stack,
-                )
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                check(statement.iter)
+                state = dict(tainted)
+                self._assign_taint(statement.target, taint_of(statement.iter), state)
+                returned = run(statement.body, state)
+                else_state, else_ret = branch(statement.orelse)
+                merge(state, else_state)
+                for r in (returned, else_ret):
+                    if r is not None:
+                        return_origin = r
+                continue
 
-                self._execute_interprocedural(
-                    function_node=self._temporary_block_function(
-                        function_node,
-                        statement.orelse,
-                    ),
-                    tainted=tainted,
-                    function_by_name=function_by_name,
-                    source_names=source_names,
-                    sanitizer_names=sanitizer_names,
-                    sink_names=sink_names,
-                    result=result,
-                    summaries=summaries,
-                    call_stack=current_stack,
-                )
+            if isinstance(statement, ast.While):
+                check(statement.test)
+                body_state, body_ret = branch(statement.body)
+                else_state, else_ret = branch(statement.orelse)
+                merge(body_state, else_state)
+                for r in (body_ret, else_ret):
+                    if r is not None:
+                        return_origin = r
+                continue
+
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    check(item.context_expr)
+                    if item.optional_vars is not None:
+                        self._assign_taint(
+                            item.optional_vars, taint_of(item.context_expr), tainted,
+                        )
+                returned = run(statement.body, tainted)
+                if returned is not None:
+                    return_origin = returned
+                continue
+
+            try_types = tuple(
+                t for t in (ast.Try, getattr(ast, "TryStar", None)) if t is not None
+            )
+            if isinstance(statement, try_types):
+                states = []
+                returns = []
+                for block in (
+                    statement.body,
+                    *[handler.body for handler in statement.handlers],
+                    statement.orelse,
+                ):
+                    state, returned = branch(block)
+                    states.append(state)
+                    returns.append(returned)
+                merge(*states)
+                returns.append(run(statement.finalbody, tainted))
+                for r in returns:
+                    if r is not None:
+                        return_origin = r
+                continue
+
+            match_type = getattr(ast, "Match", None)
+            if match_type is not None and isinstance(statement, match_type):
+                check(statement.subject)
+                states = []
+                for case in statement.cases:
+                    state, returned = branch(case.body)
+                    states.append(state)
+                    if returned is not None:
+                        return_origin = returned
+                merge(*states)
+                continue
 
         return return_origin
 
@@ -1295,6 +1704,24 @@ class TaintAnalyzer:
                 node.id
             )
 
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            attribute_source = catalog.expression_source(node)
+
+            if attribute_source is not None:
+                return _TaintOrigin(
+                    source_name=attribute_source,
+                    source_line=getattr(node, "lineno", 0),
+                )
+
+        if isinstance(node, ast.Attribute) and node.attr in self.PATH_NEUTRAL_ATTRS:
+            return self._neutralize(
+                self._expression_taint_interprocedural(
+                    node.value, tainted, function_by_name, source_names,
+                    sanitizer_names, summaries, call_stack,
+                ),
+                "PATH_TRAVERSAL",
+            )
+
         if isinstance(
             node,
             ast.Call,
@@ -1308,6 +1735,18 @@ class TaintAnalyzer:
             if call_name in sanitizer_names:
                 return None
 
+            if call_name in self.PATH_NEUTRAL_CALLS:
+                return self._neutralize(
+                    self._pick(
+                        self._expression_taint_interprocedural(
+                            a, tainted, function_by_name, source_names,
+                            sanitizer_names, summaries, call_stack,
+                        )
+                        for a in node.args
+                    ),
+                    "PATH_TRAVERSAL",
+                )
+
             # Direct source.
             source_origin = (
                 self._source_origin_from_call(
@@ -1319,51 +1758,26 @@ class TaintAnalyzer:
             if source_origin is not None:
                 return source_origin
 
-            # Known project function.
-            callee = function_by_name.get(
-                call_name
+            # Known project function: what does it actually return?
+            callee = self._resolve_callee(
+                node,
+                function_by_name,
             )
 
-            if (
-                callee is not None
-                and summaries.get(
-                    call_name,
-                    False,
-                )
-            ):
+            if callee is not None and callee.name not in call_stack:
 
-                argument_origins = [
-                    self._expression_taint_interprocedural(
-                        argument,
-                        tainted,
-                        function_by_name,
-                        source_names,
-                        sanitizer_names,
-                        summaries,
-                        call_stack,
-                    )
-                    for argument in node.args
-                ]
-
-                for origin in argument_origins:
-                    if origin is not None:
-                        return origin
-
-                # The callee itself may contain a source.
-                source_nodes = self._find_sources(
+                scalar, _ = self._call_return_shape(
+                    node,
                     callee,
+                    tainted,
+                    function_by_name,
                     source_names,
+                    sanitizer_names,
+                    summaries,
+                    call_stack,
                 )
 
-                if source_nodes:
-                    source = source_nodes[0]
-
-                    return _TaintOrigin(
-                        source_name=source.name,
-                        source_line=source.line,
-                    )
-
-                return None
+                return scalar
 
             # Unknown call: inspect arguments.
             for argument in node.args:
@@ -1382,26 +1796,53 @@ class TaintAnalyzer:
                 if origin is not None:
                     return origin
 
+            for keyword in node.keywords:
+                origin = (
+                    self._expression_taint_interprocedural(
+                        keyword.value,
+                        tainted,
+                        function_by_name,
+                        source_names,
+                        sanitizer_names,
+                        summaries,
+                        call_stack,
+                    )
+                )
+
+                if origin is not None:
+                    return origin
+
+            # Method receivers: name.strip(), query.format(...)
+            if isinstance(node.func, ast.Attribute):
+                origin = (
+                    self._expression_taint_interprocedural(
+                        node.func.value,
+                        tainted,
+                        function_by_name,
+                        source_names,
+                        sanitizer_names,
+                        summaries,
+                        call_stack,
+                    )
+                )
+
+                if origin is not None:
+                    return origin
+
             return None
 
-        for child in ast.iter_child_nodes(node):
-
-            origin = (
-                self._expression_taint_interprocedural(
-                    child,
-                    tainted,
-                    function_by_name,
-                    source_names,
-                    sanitizer_names,
-                    summaries,
-                    call_stack,
-                )
+        return self._pick(
+            self._expression_taint_interprocedural(
+                child,
+                tainted,
+                function_by_name,
+                source_names,
+                sanitizer_names,
+                summaries,
+                call_stack,
             )
-
-            if origin is not None:
-                return origin
-
-        return None
+            for child in ast.iter_child_nodes(node)
+        )
 
     # ============================================================
     # INTERPROCEDURAL SINKS
@@ -1439,9 +1880,16 @@ class TaintAnalyzer:
             # Direct sink.
             # ----------------------------------------------------
 
-            if sink_name in sink_names:
+            resolved = self._resolve_sink(
+                ast_node,
+                sink_names,
+            )
 
-                for argument in ast_node.args:
+            if resolved is not None:
+
+                canonical_sink, sink_arguments, sink_rule = resolved
+
+                for argument in sink_arguments:
 
                     origin = (
                         self._expression_taint_interprocedural(
@@ -1468,44 +1916,16 @@ class TaintAnalyzer:
                             argument
                         )
 
-                    sink_line = getattr(
-                        ast_node,
-                        "lineno",
-                        0,
-                    )
+                    if sink_rule in origin.neutralized:
+                        continue
 
-                    finding = TaintFlowFinding(
-                        source_name=origin.source_name,
-                        source_line=origin.source_line,
-                        sink_name=sink_name,
-                        sink_line=sink_line,
-                        variable=variable,
-                        path=(
-                            origin.source_name,
-                            variable,
-                            sink_name,
-                        ),
+                    self._record_flow(
+                        result,
+                        origin,
+                        canonical_sink,
+                        getattr(ast_node, "lineno", 0),
+                        variable,
                     )
-
-                    result.findings.append(
-                        finding
-                    )
-
-                    vulnerability = (
-                        self.vulnerability_engine.analyze_flow(
-                            source_name=origin.source_name,
-                            source_line=origin.source_line,
-                            sink_name=sink_name,
-                            sink_line=sink_line,
-                            variable=variable,
-                            path=finding.path,
-                        )
-                    )
-
-                    if vulnerability is not None:
-                        result.vulnerabilities.append(
-                            vulnerability
-                        )
 
                 continue
 
@@ -1513,8 +1933,9 @@ class TaintAnalyzer:
             # Project function call.
             # ----------------------------------------------------
 
-            callee = function_by_name.get(
-                sink_name
+            callee = self._resolve_callee(
+                ast_node,
+                function_by_name,
             )
 
             if callee is None:
@@ -1523,50 +1944,160 @@ class TaintAnalyzer:
             if callee.name in call_stack:
                 continue
 
-            # Map tainted caller arguments to callee parameters.
-            for index, argument in enumerate(
-                ast_node.args
-            ):
+            # Run the callee once with every tainted parameter.
+            state = self._map_call_arguments(
+                ast_node,
+                callee,
+                tainted,
+                function_by_name,
+                source_names,
+                sanitizer_names,
+                summaries,
+                call_stack,
+            )
 
-                if index >= len(
-                    callee.args.args
+            if not state:
+                continue
+
+            self._execute_interprocedural(
+                function_node=callee,
+                tainted=state,
+                function_by_name=function_by_name,
+                source_names=source_names,
+                sanitizer_names=sanitizer_names,
+                sink_names=sink_names,
+                result=result,
+                summaries=summaries,
+                call_stack=call_stack,
+            )
+
+    # ============================================================
+    # SINK RESOLUTION / FINDING RECORDING
+    # ============================================================
+
+    def _resolve_sink(
+        self,
+        call: ast.Call,
+        sink_names: set[str],
+    ) -> Optional[tuple[str, list[ast.AST], Optional[str]]]:
+        """Return (canonical sink name, argument nodes that matter, rule id)."""
+
+        if self._use_catalog_sinks:
+            match = catalog.match_sink(call)
+
+            if match is not None:
+                spec, canonical = match
+
+                first = call.args[0] if call.args else None
+
+                if (
+                    spec.shell_sensitive
+                    and isinstance(first, ast.Name)
+                    and self._argv_frames
+                    and first.id in self._argv_frames[-1]
+                    and not catalog.has_shell_true(call)
                 ):
-                    break
+                    # cmd = ["git", ...]; subprocess.run(cmd)  -> no shell
+                    return None
 
-                origin = (
-                    self._expression_taint_interprocedural(
-                        argument,
-                        tainted,
-                        function_by_name,
-                        source_names,
-                        sanitizer_names,
-                        summaries,
-                        call_stack,
-                    )
+                return (
+                    canonical,
+                    catalog.sink_arguments(call, spec),
+                    spec.rule_id,
                 )
 
-                if origin is None:
-                    continue
+        name = self._call_name(call)
 
-                parameter = callee.args.args[
-                    index
-                ].arg
+        if name in sink_names:
+            return name, [
+                *call.args,
+                *(keyword.value for keyword in call.keywords),
+            ], None
 
-                callee_state = {
-                    parameter: origin
-                }
+        return None
 
-                self._execute_interprocedural(
-                    function_node=callee,
-                    tainted=callee_state,
-                    function_by_name=function_by_name,
-                    source_names=source_names,
-                    sanitizer_names=sanitizer_names,
-                    sink_names=sink_names,
-                    result=result,
-                    summaries=summaries,
-                    call_stack=call_stack,
-                )
+    def _record_flow(
+        self,
+        result: TaintAnalysisResult,
+        origin: _TaintOrigin,
+        sink_name: str,
+        sink_line: int,
+        variable: str,
+    ) -> None:
+
+        function_id = (
+            self._function_stack[-1]
+            if self._function_stack
+            else ""
+        )
+
+        file_path = function_id.partition("::")[0] if function_id else ""
+        function_name = function_id.rpartition("::")[2] if function_id else ""
+
+        finding = TaintFlowFinding(
+            source_name=origin.source_name,
+            source_line=origin.source_line,
+            sink_name=sink_name,
+            sink_line=sink_line,
+            variable=variable,
+            path=(
+                origin.source_name,
+                variable,
+                sink_name,
+            ),
+            file=file_path,
+            function=function_name,
+            function_id=function_id,
+        )
+
+        result.findings.append(finding)
+
+        vulnerability = self.vulnerability_engine.analyze_flow(
+            source_name=origin.source_name,
+            source_line=origin.source_line,
+            sink_name=sink_name,
+            sink_line=sink_line,
+            variable=variable,
+            path=finding.path,
+            file=file_path,
+            function=function_name,
+            function_id=function_id,
+        )
+
+        if vulnerability is not None:
+            result.vulnerabilities.append(vulnerability)
+
+    @staticmethod
+    def _dedupe(result: TaintAnalysisResult) -> None:
+        """One finding per sink location (same sink reached by several paths)."""
+
+        seen: set[tuple] = set()
+        findings = []
+
+        for finding in result.findings:
+            key = (finding.function_id, finding.sink_name, finding.sink_line)
+
+            if key not in seen:
+                seen.add(key)
+                findings.append(finding)
+
+        seen_vulns: set[tuple] = set()
+        vulnerabilities = []
+
+        for vulnerability in result.vulnerabilities:
+            key = (
+                vulnerability.function_id,
+                vulnerability.rule_id,
+                vulnerability.sink_name,
+                vulnerability.sink_line,
+            )
+
+            if key not in seen_vulns:
+                seen_vulns.add(key)
+                vulnerabilities.append(vulnerability)
+
+        result.findings = findings
+        result.vulnerabilities = vulnerabilities
 
     # ============================================================
     # FUNCTION SUMMARY
@@ -1625,33 +2156,26 @@ class TaintAnalyzer:
         source_names: set[str],
     ) -> list[TaintSource]:
 
-        sources = []
+        sources: list[TaintSource] = []
 
-        for node in TaintAnalyzer._walk_function(
-            function_node
-        ):
-
-            if not isinstance(
-                node,
-                ast.Call,
-            ):
+        for node in TaintAnalyzer._walk_function(function_node):
+            if not isinstance(node, ast.Call):
                 continue
 
-            name = TaintAnalyzer._call_name(
-                node
+            name = TaintAnalyzer._source_name_for_call(
+                node,
+                source_names,
             )
 
-            if name in source_names:
-                sources.append(
-                    TaintSource(
-                        name=name,
-                        line=getattr(
-                            node,
-                            "lineno",
-                            0,
-                        ),
-                    )
+            if name is None:
+                continue
+
+            sources.append(
+                TaintSource(
+                    name=name,
+                    line=getattr(node, "lineno", 0),
                 )
+            )
 
         return sources
 
@@ -1727,6 +2251,73 @@ class TaintAnalyzer:
 
         return sinks
 
+    
+    @staticmethod
+    def _is_request_source(node: ast.Call) -> bool:
+        """Recognize common web-framework request inputs."""
+
+        if not isinstance(node.func, ast.Attribute):
+            return False
+
+        method = node.func.attr
+
+        # request.GET.get(...), request.POST.get(...), etc.
+        if method == "get":
+            receiver = node.func.value
+
+            if not isinstance(receiver, ast.Attribute):
+                return False
+
+            if receiver.attr not in {
+                "GET",
+                "POST",
+                "headers",
+                "query_params",
+                "cookies",
+            }:
+                return False
+
+            request_object = receiver.value
+
+            return (
+                isinstance(request_object, ast.Name)
+                and request_object.id in {"request", "req"}
+            )
+
+        # request.json() and request.get_json()
+        if method in {"json", "get_json"}:
+            receiver = node.func.value
+
+            return (
+                isinstance(receiver, ast.Name)
+                and receiver.id in {"request", "req"}
+            )
+
+        return False
+
+    @staticmethod
+    def _source_name_for_call(
+        node: ast.Call,
+        source_names: set[str],
+    ) -> Optional[str]:
+        """Resolve a call to a recognized taint source."""
+
+        catalog_source = catalog.expression_source(node)
+
+        if catalog_source is not None:
+            return catalog_source
+
+        call_name = TaintAnalyzer._call_name(node)
+
+        if call_name in source_names:
+            return call_name
+
+        if TaintAnalyzer._is_request_source(node):
+            return "request"
+
+        return None
+    
+    
     # ============================================================
     # HELPERS
     # ============================================================
