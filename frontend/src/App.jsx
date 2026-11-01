@@ -18,6 +18,10 @@ import FindingsTable from "./components/FindingsTable";
 import FindingDetails from "./components/FindingDetails";
 import CallGraphPanel from "./components/CallGraphPanel";
 import CFGPanel from "./components/CFGPanel";
+import AICorrectionsPage from "./pages/AICorrectionsPage";
+import PatchVerificationPage from "./pages/PatchVerificationPage";
+import PatchHistoryPage from "./pages/PatchHistoryPage";
+import { usePipeline } from "./hooks/usePipeline";
 
 import { useRepositoryAnalysis } from "./hooks/useRepositoryAnalysis";
 
@@ -149,6 +153,7 @@ function App() {
     runAnalysis,
   } = useRepositoryAnalysis("tests/sample_project");
 
+  const pipeline = usePipeline();
   const hasAnalysis = Boolean(data);
   const currentPage = pageInfo[activePage];
 
@@ -401,14 +406,13 @@ function App() {
               )
             )}
 
-            {/* REMEDIATION PAGES */}
-            {["fixes", "verification", "history"].includes(
-              activePage
-            ) && (
-              <section className="dashboard-section">
-                <FeatureComingSoon page={activePage} />
-              </section>
+            {activePage === "fixes" && <AICorrectionsPage pipeline={pipeline} />}
+
+            {activePage === "verification" && (
+              <PatchVerificationPage pipeline={pipeline} onNavigate={setActivePage} />
             )}
+
+            {activePage === "history" && <PatchHistoryPage />}
 
           </div>
 

@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 
 DEFAULT_IMAGE = "code-guardian-sandbox:latest"
 
@@ -50,7 +51,27 @@ def _make_world_readable(workspace: Path) -> None:
     except OSError:
         pass
 
+_DOCKER_DIR = Path(__file__).resolve().parents[2] / "docker"
+_BASE_BUILD_LOCK = threading.Lock()
 
+
+def _build_base_image(docker: str, image: str) -> bool:
+    """Rebuild the default sandbox image from docker/Dockerfile.sandbox when it
+    has been deleted (for example by a Docker cleanup). True when it exists."""
+    dockerfile = _DOCKER_DIR / "Dockerfile.sandbox"
+    if image != DEFAULT_IMAGE or not dockerfile.is_file():
+        return False
+    with _BASE_BUILD_LOCK:
+        if subprocess.run([docker, "image", "inspect", image],
+                          capture_output=True, check=False).returncode == 0:
+            return True
+        proc = subprocess.run(
+            [docker, "build", "-f", str(dockerfile), "--build-arg", "EXTRA_PIP=pytest",
+             "-t", image, str(_DOCKER_DIR)],
+            capture_output=True, timeout=900, check=False,
+        )
+        return proc.returncode == 0
+    
 class DockerSandbox:
     name = "docker"
 
@@ -73,7 +94,7 @@ class DockerSandbox:
             raise SandboxUnavailable("the Docker daemon is not running (start Docker Desktop)")
         image = subprocess.run([self._docker, "image", "inspect", self.image],
                                capture_output=True, check=False)
-        if image.returncode != 0:
+        if image.returncode != 0 and not _build_base_image(self._docker, self.image):
             raise SandboxUnavailable(
                 f"sandbox image '{self.image}' is missing. Build it with: "
                 f"docker build -f docker/Dockerfile.sandbox -t {self.image} ."
@@ -95,7 +116,8 @@ class DockerSandbox:
             "--read-only", "--tmpfs", "/tmp:rw,exec,size=256m",
             "--user", "65534:65534",
             "--env", "HOME=/tmp", "--env", "PYTHONDONTWRITEBYTECODE=1",
-            "--env", "PYTHONPATH=/tmp/work",
+            "--env", "PYTHONPATH=" + ":".join(["/tmp/work", *getattr(self, "extra_pythonpath", [])]),
+            *[arg for k, v in getattr(self, "extra_env", {}).items() for arg in ("--env", f"{k}={v}")],
             "-v", f"{workspace}:/src:ro",
             self.image, "sh", "-c", inner, "sh", *command,
         ]
@@ -136,13 +158,13 @@ class LocalRunner:
                           round(time.monotonic() - start, 3))
 
 
-def get_sandbox_runner():
+def get_sandbox_runner(image: str | None = None):
     """Return a ready runner or raise SandboxUnavailable (fail closed)."""
     mode = os.getenv("CODE_GUARDIAN_SANDBOX", "docker").strip().lower()
     if mode == "local":
         runner = LocalRunner()
     elif mode == "docker":
-        runner = DockerSandbox()
+        runner = DockerSandbox(image = image)
     else:
         raise SandboxUnavailable("CODE_GUARDIAN_SANDBOX must be 'docker' or 'local'")
     runner.check_ready()

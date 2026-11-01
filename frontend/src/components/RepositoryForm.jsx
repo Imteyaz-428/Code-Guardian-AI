@@ -7,12 +7,15 @@ function RepositoryForm({
   loading,
   error,
 }) {
+  const input = repositoryPath.trim();
+
+  const isGitHubRepository =
+    /^https?:\/\/github\.com\/[^/]+\/[^/]+\/?(?:\.git)?$/i.test(input);
+
   const handleSubmit = (event) => {
     event.preventDefault();
 
-    const path = repositoryPath.trim();
-
-    if (!loading && path) {
+    if (!loading && input) {
       onAnalyze();
     }
   };
@@ -22,11 +25,11 @@ function RepositoryForm({
       <div className="analyze-header">
         <div>
           <label htmlFor="repository-path">
-            Repository Path
+            Repository Workspace
           </label>
 
           <p>
-            Enter the local path of the repository you want to analyze.
+            Analyze a local repository or a public GitHub repository.
           </p>
         </div>
       </div>
@@ -34,7 +37,7 @@ function RepositoryForm({
       <form className="input-row" onSubmit={handleSubmit}>
         <div className="input-wrapper">
           <span className="input-prefix" aria-hidden="true">
-            $
+            {isGitHubRepository ? "↗" : "$"}
           </span>
 
           <input
@@ -45,7 +48,7 @@ function RepositoryForm({
             onChange={(event) =>
               onRepositoryPathChange(event.target.value)
             }
-            placeholder="tests/sample_project"
+            placeholder="Local path or https://github.com/owner/repo"
             autoComplete="off"
             spellCheck="false"
             disabled={loading}
@@ -55,7 +58,7 @@ function RepositoryForm({
 
         <button
           type="submit"
-          disabled={loading || !repositoryPath.trim()}
+          disabled={loading || !input}
         >
           {loading ? (
             <>
@@ -72,7 +75,9 @@ function RepositoryForm({
       </form>
 
       <p id="repository-help" className="input-help">
-        Example: tests/sample_project
+        {isGitHubRepository
+          ? "GitHub repository detected. The GitHub URL will be sent to the backend."
+          : "Enter a local folder path, such as tests/sample_project, or paste a GitHub repository URL."}
       </p>
 
       {error && <ErrorBanner message={error} />}

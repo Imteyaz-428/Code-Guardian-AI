@@ -178,7 +178,18 @@ def _generate(req: VerifiedFixRequest, root: Path, rel: str, previous, feedback)
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-
+def _reviewed_without_tests(v: dict) -> bool:
+    """Smoke-level pass: the module imports, the original finding is gone and
+    no new findings appeared, but the repo has no tests to run."""
+    sec = v.get("security") or {}
+    return (v.get("status") == "syntax_passed"
+            and v.get("verification_level") == "smoke"
+            and "IMPORT_OK" in v.get("stdout", "")
+            and sec.get("available") is True
+            and not sec.get("introduced")
+            and sec.get("fix_confirmed") is not False)
+    
+    
 @router.post("/fix-verified", response_model=VerifiedFixResponse)
 def fix_verified(request: VerifiedFixRequest) -> VerifiedFixResponse:
     """Generate a fix, test it in a Docker sandbox, retry on failure.
@@ -239,7 +250,28 @@ def fix_verified(request: VerifiedFixRequest) -> VerifiedFixResponse:
             v = verifier.verify(root, rel, full, rule_id=rule_id, function_name=request.function_name)
             last = v
             attempts.append(Attempt(attempt=n, status=v["status"], message=v["message"]))
-
+            if _reviewed_without_tests(v):
+                review = ai_verifier.review(
+                    function_name=request.function_name, finding=request.finding,
+                    explanation=request.explanation, original_code=result.original_code,
+                    corrected_code=result.corrected_code, sandbox_summary=v["message"])
+                if review.verdict == "reject":
+                    msg = "AI reviewer rejected the patch: " + review.reasoning
+                    attempts[-1] = Attempt(attempt=n, status="rejected", message=msg)
+                    feedback = msg
+                    if review.new_risks:
+                        feedback += "\nNew risks: " + "; ".join(review.new_risks)
+                    continue
+                # Not registered for auto-apply: only tested patches can be applied by the API.
+                return VerifiedFixResponse(
+                    status="reviewed",
+                    message=("Import check passed, the security finding is gone and no new findings "
+                             "appeared, but the repo has no tests, so behavior was NOT tested. "
+                             "Review the change before using it."),
+                    file_path=rel, function_name=request.function_name,
+                    corrected_code=result.corrected_code, explanation=result.explanation,
+                    patch=result.patch, verification=Verification(**v), attempts=attempts,
+                    risk_explanation=risk_explanation, ai_review=review.to_dict())
             if v["status"] == "verified":
                 review = ai_verifier.review(
                     function_name=request.function_name, finding=request.finding,

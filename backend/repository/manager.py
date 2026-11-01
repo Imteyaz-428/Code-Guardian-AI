@@ -4,6 +4,16 @@ from pathlib import Path
 
 from backend.core.config import settings
 
+IGNORED_DIRS = {
+    "venv", ".venv", "env", "site-packages", "dist-packages", "node_modules",
+    ".git", "build", "dist", "__pycache__", ".tox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache",
+}
+
+
+def _is_ignored(parts) -> bool:
+    return any(p in IGNORED_DIRS or p.endswith(".egg-info") for p in parts)
+
 
 class RepositoryManager:
     """Validate and enumerate repositories allowed for analysis."""
@@ -49,7 +59,7 @@ class RepositoryManager:
 
             relative_path = path.relative_to(self.repository_path)
 
-            if "__pycache__" in relative_path.parts:
+            if _is_ignored(relative_path.parts[:-1]):
                 continue
 
             if not include_tests and any(

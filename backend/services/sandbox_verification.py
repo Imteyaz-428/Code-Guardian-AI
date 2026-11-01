@@ -11,6 +11,8 @@ from typing import Any
 
 from backend.services.sandbox_runner import SandboxUnavailable, get_sandbox_runner
 from backend.services.security_rescan import SecurityRescanService
+from backend.services.sandbox_env import ensure_repo_image
+from backend.services.sandbox_vars import sandbox_env_vars
 
 IGNORED = {
     ".git", ".venv", "venv", "node_modules", "datasets", "artifacts",
@@ -79,10 +81,11 @@ class SandboxVerificationService:
         if not (root / rel).is_file():
             raise FileNotFoundError(f"Target file not found: {relative_file}")
         start = time.monotonic()
+        env_note = ""
 
         def out(status, message, level="none", sandbox="none", run=None, **extra):
             return {
-                "status": status, "message": message, "verification_level": level,
+                "status": status, "message": f"{message} {env_note}".strip(), "verification_level": level,
                 "sandbox": sandbox, "duration_seconds": round(time.monotonic() - start, 3),
                 "stdout": (run.stdout if run else "")[-12000:],
                 "stderr": (run.stderr if run else "")[-12000:],
@@ -95,12 +98,18 @@ class SandboxVerificationService:
             return out("rejected", f"Syntax error: {exc.msg} (line {exc.lineno}).")
 
         try:
-            runner = get_sandbox_runner()
+            image, env_note = ensure_repo_image(root)
+            runner = get_sandbox_runner(image=image)
         except SandboxUnavailable as exc:
             return out("syntax_passed", f"Sandbox unavailable: {exc}. Patch is NOT verified.",
                        sandbox="unavailable")
-
+        runner.extra_env = sandbox_env_vars(root)   # placeholders only, never real secrets
         timeout = max(5, min(int(timeout_seconds), 180))
+        # Many repos import their own modules as if started from a sub-folder
+        # (e.g. `from models import X` inside backend/). Add those folders.
+        runner.extra_pythonpath = [
+            f"/tmp/work/{p.as_posix()}" for p in list(rel.parents)[1:] if p.as_posix() != "."
+        ]
         with tempfile.TemporaryDirectory(prefix="codeguardian-verify-") as tmp:
             ws = Path(tmp) / "repo"
             shutil.copytree(root, ws, ignore=_ignore, symlinks=False)

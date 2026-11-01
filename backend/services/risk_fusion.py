@@ -191,6 +191,20 @@ def attribute_vulnerabilities(
 
     return dict(by_function), unattributed
 
+LOCAL_SOURCES = {"argv", "stdin", "input", "environ", "getenv"}
+
+
+def source_factor(vuln: dict[str, Any]) -> float:
+    name = str(vuln.get("source", "")).split(" (")[0].split(".")[-1].lower()
+    return 0.6 if name in LOCAL_SOURCES else 1.0
+
+
+def vuln_floor() -> float:
+    try:
+        value = float(os.getenv("CODE_GUARDIAN_VULN_FLOOR", "0.75"))
+    except ValueError:
+        value = 0.75
+    return min(max(value, 0.0), 1.0)
 
 def structural_weight() -> float:
     """How much complexity-only signals count as SECURITY risk (0-1).
@@ -221,7 +235,7 @@ def fuse(
         basis = "static+gnn"
 
     if vulnerability:
-        final = max(final, 0.9 * vulnerability)
+        final = max(final, vuln_floor() * vulnerability)
 
     final = round(min(final, 100.0), 1)
 
