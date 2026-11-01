@@ -1,0 +1,511 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/core/config.py backend/core/config.py
+--- a/backend/core/config.py	2026-10-27 16:36:37.405150525 +0000
++++ b/backend/core/config.py	2026-10-27 16:37:12.827227564 +0000
+@@ -14,6 +14,9 @@
+     def __init__(self) -> None:
+         # Load environment variables from the project root .env file.
+         load_dotenv(self.PROJECT_ROOT / ".env")
++        # The backend/.env file is the one that actually holds the AI settings;
++        # without this, CODE_GUARDIAN_AI_PROVIDERS is read before it is loaded.
++        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+ 
+         # Repository analysis configuration
+         self.ALLOWED_ANALYSIS_ROOT = self._get_analysis_root()
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/ai/ai_service.py backend/services/ai/ai_service.py
+--- a/backend/services/ai/ai_service.py	2026-10-27 16:36:37.410429113 +0000
++++ b/backend/services/ai/ai_service.py	2026-10-27 16:36:59.166878895 +0000
+@@ -1,6 +1,7 @@
+ import logging
++import re
+ import time
+-from typing import Iterator, Optional
++from typing import Iterable, Iterator, Optional
+ 
+ from .config import AI_MAX_RETRIES, AI_PROVIDERS, AI_RETRY_DELAY
+ from .providers.deepseek_provider import DeepSeekProvider
+@@ -15,14 +16,85 @@
+     "deepseek": DeepSeekProvider,
+ }
+ 
++_SECRET_RE = re.compile(
++    r"(AIza[0-9A-Za-z_\-]{20,}|gsk_[0-9A-Za-z]{20,}|sk-[0-9A-Za-z_\-]{16,}"
++    r"|Bearer\s+\S+|(?i:key)=[^&\s]+)"
++)
++
++
++def _redact(text: str, limit: int = 300) -> str:
++    """Raw provider messages may echo keys/URLs: strip them before logging."""
++    return _SECRET_RE.sub("<redacted>", str(text))[:limit]
++
++
++def _status_code(exc: Exception) -> Optional[int]:
++    for holder in (exc, getattr(exc, "response", None)):
++        for attr in ("status_code", "code"):
++            value = getattr(holder, attr, None)
++            if isinstance(value, int) and 100 <= value <= 599:
++                return value
++    return None
++
++
++def classify_error(exc: Exception) -> tuple[str, bool, Optional[int]]:
++    """Return (category, retryable, http_status).
++
++    Retry only what can fix itself (timeouts, 5xx, empty reply). Auth, billing,
++    quota/rate-limit and missing-model errors will not change in 1.5 seconds,
++    so we move straight to the next provider instead of wasting time.
++    """
++    status = _status_code(exc)
++    text = f"{type(exc).__name__} {exc}".lower()
++
++    if status in (401, 403) or any(k in text for k in ("unauthorized", "permission denied", "api_key_invalid", "invalid api key", "api key not valid")):
++        return "authentication failed", False, status
++    if status == 402 or any(k in text for k in ("insufficient balance", "billing", "payment required")):
++        return "billing or credits exhausted", False, status
++    if status == 429 or any(k in text for k in ("quota", "rate limit", "rate_limit", "resource_exhausted")):
++        return "quota or rate limit", False, status
++    if status == 404 or any(k in text for k in ("model not found", "not_found", "decommissioned", "does not exist")):
++        return "model not found", False, status
++    if status == 400:
++        return "bad request", False, status
++    if "timeout" in text or "timed out" in text:
++        return "timeout", True, status
++    if (status is not None and status >= 500) or any(k in text for k in ("overloaded", "unavailable", "internal error")):
++        return "provider unavailable", True, status
++    if "empty response" in text:
++        return "empty response", True, status
++    return "unknown error", True, status
++
+ 
+ class AIProviderError(Exception):
+-    """Raised when every AI provider fails."""
++    """Raised when every AI provider fails (or none is left to try).
++
++    `attempts` holds one dict per failure: provider, category, retryable, status.
++    `summary` is safe to put in an API response (no raw provider messages).
++    """
++
++    def __init__(self, message: str = "", attempts: Optional[list[dict]] = None):
++        super().__init__(message)
++        self.attempts = attempts or []
++
++    @property
++    def summary(self) -> str:
++        latest: dict[str, str] = {}
++        for a in self.attempts:
++            label = a["category"] + (f" (HTTP {a['status']})" if a.get("status") else "")
++            latest[a["provider"]] = label
++        return "; ".join(f"{p}: {c}" for p, c in latest.items())
+ 
+ 
+ class AIService:
+     def __init__(self, provider_names: Optional[list[str]] = None):
+-        self.provider_names = provider_names or AI_PROVIDERS
++        requested = provider_names or AI_PROVIDERS
++        unknown = [n for n in requested if n not in PROVIDER_CLASSES]
++        if unknown:
++            logger.warning(
++                "Ignoring unknown AI provider(s) %s. Supported: %s",
++                unknown, sorted(PROVIDER_CLASSES),
++            )
++        self.provider_names = [n for n in requested if n in PROVIDER_CLASSES]
+         self._providers = {}
+ 
+     def _get_provider(self, name: str):
+@@ -38,17 +110,30 @@
+         return provider
+ 
+     def generate_with_info(
+-        self, prompt: str, system_prompt: Optional[str] = None
++        self,
++        prompt: str,
++        system_prompt: Optional[str] = None,
++        skip: Optional[Iterable[str]] = None,
+     ) -> tuple[str, str]:
+-        """Return (text, provider_name) from the first provider that succeeds."""
+-        errors = []
++        """Return (text, provider_name) from the first provider that succeeds.
++
++        `skip` lets a caller exclude providers whose output it already rejected
++        (e.g. unparsable reply), so the next call really falls back to another one.
++        """
++        skipped = set(skip or ())
++        attempts: list[dict] = []
++        details: list[str] = []
+ 
+         for name in self.provider_names:
++            if name in skipped:
++                continue
++
+             try:
+                 provider = self._get_provider(name)
+             except Exception as e:
+-                logger.warning("Provider %s unavailable: %s", name, e)
+-                errors.append(f"{name}: {e}")
++                logger.warning("Provider %s unavailable: %s", name, _redact(e))
++                attempts.append({"provider": name, "category": "not configured", "retryable": False, "status": None})
++                details.append(f"{name}: not configured ({_redact(e, 120)})")
+                 continue
+ 
+             for attempt in range(1, AI_MAX_RETRIES + 1):
+@@ -57,15 +142,24 @@
+                     logger.info("AI response generated by %s", name)
+                     return result, name
+                 except Exception as e:
++                    category, retryable, status = classify_error(e)
+                     logger.warning(
+-                        "%s failed (attempt %d/%d): %s", name, attempt, AI_MAX_RETRIES, e
++                        "%s failed (attempt %d/%d) [%s%s]: %s: %s",
++                        name, attempt, AI_MAX_RETRIES, category,
++                        f", HTTP {status}" if status else "", type(e).__name__, _redact(e),
+                     )
+-                    errors.append(f"{name}: {e}")
++                    attempts.append({"provider": name, "category": category, "retryable": retryable, "status": status})
++                    details.append(f"{name}: {category}")
++                    if not retryable:
++                        break
+                     if attempt < AI_MAX_RETRIES:
+                         time.sleep(AI_RETRY_DELAY * attempt)
+ 
+-        logger.error("All AI providers failed")
+-        raise AIProviderError("All AI providers failed: " + " | ".join(errors))
++        if not attempts:
++            raise AIProviderError("No AI provider left to try", attempts)
++
++        logger.error("All AI providers failed: %s", " | ".join(details))
++        raise AIProviderError("All AI providers failed: " + " | ".join(details), attempts)
+ 
+     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+         return self.generate_with_info(prompt, system_prompt)[0]
+@@ -76,7 +170,8 @@
+         Agar beech stream me fail ho jaye to dusre provider pe switch nahi karte
+         (warna answer aadha-aadha mix ho jayega).
+         """
+-        errors = []
++        attempts: list[dict] = []
++        details: list[str] = []
+ 
+         for name in self.provider_names:
+             started = False
+@@ -90,13 +185,15 @@
+                 return
+ 
+             except Exception as e:
+-                logger.warning("%s stream failed: %s", name, e)
+-                errors.append(f"{name}: {e}")
++                category, retryable, status = classify_error(e)
++                logger.warning("%s stream failed [%s]: %s", name, category, _redact(e))
++                attempts.append({"provider": name, "category": category, "retryable": retryable, "status": status})
++                details.append(f"{name}: {category}")
+ 
+                 if started:
+                     raise AIProviderError(
+-                        f"{name} failed mid-stream: {e}"
++                        f"{name} failed mid-stream: {category}", attempts
+                     ) from e
+ 
+-        logger.error("All AI providers failed (stream)")
+-        raise AIProviderError("All AI providers failed: " + " | ".join(errors))
+\ No newline at end of file
++        logger.error("All AI providers failed (stream): %s", " | ".join(details))
++        raise AIProviderError("All AI providers failed: " + " | ".join(details), attempts)
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/ai/config.py backend/services/ai/config.py
+--- a/backend/services/ai/config.py	2026-10-27 16:36:37.410444055 +0000
++++ b/backend/services/ai/config.py	2026-10-27 16:37:12.827540348 +0000
+@@ -7,4 +7,7 @@
+ AI_PROVIDERS = settings.AI_PROVIDERS
+ 
+ AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
+-AI_RETRY_DELAY = float(os.getenv("AI_RETRY_DELAY", "1.5"))
+\ No newline at end of file
++AI_RETRY_DELAY = float(os.getenv("AI_RETRY_DELAY", "1.5"))
++
++# Hard cap per provider call so one hung provider cannot block the fallback chain.
++AI_REQUEST_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "30"))
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/ai/providers/deepseek_provider.py backend/services/ai/providers/deepseek_provider.py
+--- a/backend/services/ai/providers/deepseek_provider.py	2026-10-27 16:36:37.410473977 +0000
++++ b/backend/services/ai/providers/deepseek_provider.py	2026-10-27 16:37:12.828008736 +0000
+@@ -3,6 +3,7 @@
+ 
+ from dotenv import load_dotenv
+ 
++from ..config import AI_REQUEST_TIMEOUT
+ from .base_provider import BaseProvider, build_messages
+ 
+ load_dotenv()
+@@ -18,7 +19,12 @@
+ 
+         from openai import OpenAI
+ 
+-        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
++        self.client = OpenAI(
++            api_key=api_key,
++            base_url="https://api.deepseek.com",
++            timeout=AI_REQUEST_TIMEOUT,
++            max_retries=0,
++        )
+         self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+ 
+     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/ai/providers/groq_provider.py backend/services/ai/providers/groq_provider.py
+--- a/backend/services/ai/providers/groq_provider.py	2026-10-27 16:36:37.410541887 +0000
++++ b/backend/services/ai/providers/groq_provider.py	2026-10-27 16:37:12.827774230 +0000
+@@ -3,6 +3,7 @@
+ 
+ from dotenv import load_dotenv
+ 
++from ..config import AI_REQUEST_TIMEOUT
+ from .base_provider import BaseProvider, build_messages
+ 
+ load_dotenv()
+@@ -18,7 +19,7 @@
+ 
+         from groq import Groq
+ 
+-        self.client = Groq(api_key=api_key)
++        self.client = Groq(api_key=api_key, timeout=AI_REQUEST_TIMEOUT, max_retries=0)
+         self.model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+ 
+     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/ai_correction_provider.py backend/services/ai_correction_provider.py
+--- a/backend/services/ai_correction_provider.py	2026-10-27 16:36:37.410117019 +0000
++++ b/backend/services/ai_correction_provider.py	2026-10-27 16:37:38.634896361 +0000
+@@ -35,7 +35,10 @@
+     "<explanation>\n(one or two sentences)\n</explanation>"
+ )
+ 
+-MAX_FORMAT_ATTEMPTS = 3
++# Each provider gets one format retry (with a reminder); after that it is skipped
++# and the next provider in the chain is tried.
++FORMAT_ATTEMPTS_PER_PROVIDER = 2
++MAX_FORMAT_ATTEMPTS = 6
+ 
+ _TAG_CODE = re.compile(r"<corrected_code>(.*?)(?:</corrected_code>|<explanation>|\Z)", re.DOTALL | re.IGNORECASE)
+ _TAG_EXPL = re.compile(r"<explanation>(.*?)(?:</explanation>|\Z)", re.DOTALL | re.IGNORECASE)
+@@ -151,20 +154,38 @@
+         )
+ 
+         last_error: Exception | None = None
+-        for attempt in range(1, MAX_FORMAT_ATTEMPTS + 1):
++        format_failures: dict[str, int] = {}
++        skip: set[str] = set()
++        attempts_made = 0
++
++        while attempts_made < MAX_FORMAT_ATTEMPTS:
++            full_prompt = prompt + (FORMAT_REMINDER if last_error else "")
+             try:
+-                raw, provider = ai_service.generate_with_info(
+-                    prompt + (FORMAT_REMINDER if attempt > 1 else ""), system_prompt=SYSTEM_PROMPT)
++                if skip:
++                    raw, provider = ai_service.generate_with_info(
++                        full_prompt, system_prompt=SYSTEM_PROMPT, skip=skip)
++                else:
++                    raw, provider = ai_service.generate_with_info(
++                        full_prompt, system_prompt=SYSTEM_PROMPT)
+             except AIProviderError as exc:
+-                # provider error details must not leak into the API response
+-                raise RuntimeError("All AI providers failed to generate a correction.") from exc
++                if last_error is not None:
++                    # some provider answered but with unusable output, and nobody is left
++                    break
++                # Only provider names + failure categories (no raw messages/keys) go out.
++                detail = exc.summary
++                message = "All AI providers failed to generate a correction."
++                raise RuntimeError(f"{message} ({detail})" if detail else message) from exc
+ 
++            attempts_made += 1
+             try:
+                 return parse_correction(raw)
+             except CorrectionFormatError as exc:
+                 last_error = exc
++                format_failures[provider] = format_failures.get(provider, 0) + 1
++                if format_failures[provider] >= FORMAT_ATTEMPTS_PER_PROVIDER:
++                    skip.add(provider)
+                 logger.warning("Correction format problem from %s (attempt %d/%d): %s | reply starts: %r",
+-                               provider, attempt, MAX_FORMAT_ATTEMPTS, exc, raw[:160])
++                               provider, attempts_made, MAX_FORMAT_ATTEMPTS, exc, raw[:160])
+ 
+         raise RuntimeError(f"The AI did not return usable corrected code after "
+-                           f"{MAX_FORMAT_ATTEMPTS} attempts ({last_error}).")
++                           f"{attempts_made} attempts ({last_error}).")
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/test_ai_correction_provider.py backend/services/test_ai_correction_provider.py
+--- a/backend/services/test_ai_correction_provider.py	2026-10-27 16:36:37.410661291 +0000
++++ b/backend/services/test_ai_correction_provider.py	2026-10-27 16:37:32.174673054 +0000
+@@ -35,7 +35,7 @@
+     seen = []
+ 
+     class Fake:
+-        def generate_with_info(self, prompt, system_prompt=None):
++        def generate_with_info(self, prompt, system_prompt=None, skip=None):
+             seen.append(prompt)
+             return next(replies), "stub"
+ 
+@@ -47,9 +47,46 @@
+ 
+ def test_gives_up_after_max_attempts(monkeypatch):
+     class Fake:
+-        def generate_with_info(self, prompt, system_prompt=None):
++        def generate_with_info(self, prompt, system_prompt=None, skip=None):
++            if "stub" in (skip or ()):
++                raise m.AIProviderError("none left")
+             return "no code here", "stub"
+ 
+     monkeypatch.setattr(m, "ai_service", Fake())
+-    with pytest.raises(RuntimeError, match="after 3 attempts"):
++    with pytest.raises(RuntimeError, match="usable corrected code after 2 attempts"):
+         m.FallbackCorrectionProvider().generate_correction(REQ)
++
++
++def test_unusable_output_falls_back_to_next_provider(monkeypatch):
++    calls = []
++
++    class Fake:
++        def generate_with_info(self, prompt, system_prompt=None, skip=None):
++            skip = skip or set()
++            calls.append(set(skip))
++            if "first" not in skip:
++                return "I would use a parameterised query.", "first"
++            return f"<corrected_code>\n{FUNC}\n</corrected_code>", "second"
++
++    monkeypatch.setattr(m, "ai_service", Fake())
++    out = m.FallbackCorrectionProvider().generate_correction(REQ)
++    assert out.corrected_code.startswith("def search")
++    assert calls == [set(), set(), {"first"}]
++
++
++def test_provider_failure_reports_which_provider_and_why(monkeypatch):
++    class Fake:
++        def generate_with_info(self, prompt, system_prompt=None, skip=None):
++            raise m.AIProviderError("raw: key=AIzaSECRETSECRETSECRETSECRET", attempts=[
++                {"provider": "gemini", "category": "quota or rate limit", "retryable": False, "status": 429},
++                {"provider": "deepseek", "category": "billing or credits exhausted", "retryable": False, "status": 402},
++            ])
++
++    monkeypatch.setattr(m, "ai_service", Fake())
++    with pytest.raises(RuntimeError) as err:
++        m.FallbackCorrectionProvider().generate_correction(REQ)
++    msg = str(err.value)
++    assert msg.startswith("All AI providers failed to generate a correction.")
++    assert "gemini: quota or rate limit (HTTP 429)" in msg
++    assert "deepseek: billing or credits exhausted (HTTP 402)" in msg
++    assert "AIza" not in msg
+diff -ruN '--exclude=__pycache__' '--exclude=.env' '--exclude=services.zip' '--exclude=.DS_Store' backend_orig/services/test_ai_service_fallback.py backend/services/test_ai_service_fallback.py
+--- a/backend/services/test_ai_service_fallback.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/services/test_ai_service_fallback.py	2026-10-27 16:37:38.635195542 +0000
+@@ -0,0 +1,117 @@
++import pytest
++
++import importlib
++
++# `backend.services.ai.ai_service` the package attribute is the AIService instance,
++# so load the module itself to patch its globals.
++svc = importlib.import_module("backend.services.ai.ai_service")
++AIProviderError, AIService, classify_error = svc.AIProviderError, svc.AIService, svc.classify_error
++
++
++class _HttpError(Exception):
++    def __init__(self, status, msg="boom"):
++        super().__init__(msg)
++        self.status_code = status
++
++
++def _provider(behaviour, calls, name):
++    class P:
++        def __init__(self):
++            pass
++
++        def generate(self, prompt, system_prompt=None):
++            calls.append(name)
++            result = behaviour()
++            return result
++
++    return P
++
++
++@pytest.fixture(autouse=True)
++def no_sleep(monkeypatch):
++    monkeypatch.setattr(svc.time, "sleep", lambda *_: None)
++    monkeypatch.setattr(svc, "AI_MAX_RETRIES", 2)
++
++
++def _install(monkeypatch, **providers):
++    monkeypatch.setattr(svc, "PROVIDER_CLASSES", providers)
++
++
++@pytest.mark.parametrize("exc,category,retryable", [
++    (_HttpError(401), "authentication failed", False),
++    (_HttpError(402, "Insufficient Balance"), "billing or credits exhausted", False),
++    (_HttpError(429), "quota or rate limit", False),
++    (_HttpError(404), "model not found", False),
++    (_HttpError(503), "provider unavailable", True),
++    (TimeoutError("request timed out"), "timeout", True),
++    (RuntimeError("Gemini returned an empty response"), "empty response", True),
++    (RuntimeError("something odd"), "unknown error", True),
++])
++def test_classify_error(exc, category, retryable):
++    got_category, got_retryable, _ = classify_error(exc)
++    assert (got_category, got_retryable) == (category, retryable)
++
++
++def test_permanent_error_is_not_retried_and_next_provider_is_used(monkeypatch):
++    calls = []
++
++    def bad():
++        raise _HttpError(429, "quota exceeded")
++
++    _install(monkeypatch, a=_provider(bad, calls, "a"), b=_provider(lambda: "ok", calls, "b"))
++    text, name = AIService(["a", "b"]).generate_with_info("p")
++    assert (text, name) == ("ok", "b")
++    assert calls == ["a", "b"]          # 'a' tried once, not twice
++
++
++def test_transient_error_is_retried(monkeypatch):
++    calls = []
++    state = {"n": 0}
++
++    def flaky():
++        state["n"] += 1
++        if state["n"] == 1:
++            raise _HttpError(503)
++        return "ok"
++
++    _install(monkeypatch, a=_provider(flaky, calls, "a"))
++    assert AIService(["a"]).generate_with_info("p") == ("ok", "a")
++    assert calls == ["a", "a"]
++
++
++def test_skip_excludes_provider(monkeypatch):
++    calls = []
++    _install(monkeypatch, a=_provider(lambda: "A", calls, "a"), b=_provider(lambda: "B", calls, "b"))
++    assert AIService(["a", "b"]).generate_with_info("p", skip={"a"}) == ("B", "b")
++    assert calls == ["b"]
++
++
++def test_all_failed_error_carries_safe_summary(monkeypatch):
++    calls = []
++
++    def bad():
++        raise _HttpError(401, "bad key AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
++
++    _install(monkeypatch, a=_provider(bad, calls, "a"))
++    with pytest.raises(AIProviderError) as err:
++        AIService(["a", "missing_key_provider", "b"]).generate_with_info("p")
++    assert "a: authentication failed (HTTP 401)" in err.value.summary
++    assert "AIza" not in err.value.summary and "AIza" not in str(err.value)
++
++
++def test_unknown_provider_name_is_ignored_at_startup(monkeypatch):
++    _install(monkeypatch, a=_provider(lambda: "ok", [], "a"))
++    service = AIService(["a", "openai"])
++    assert service.provider_names == ["a"]
++    assert service.generate_with_info("p") == ("ok", "a")
++
++
++def test_provider_that_cannot_init_is_reported_as_not_configured(monkeypatch):
++    class NoKey:
++        def __init__(self):
++            raise ValueError("GROQ_API_KEY is missing")
++
++    _install(monkeypatch, groq=NoKey)
++    with pytest.raises(AIProviderError) as err:
++        AIService(["groq"]).generate_with_info("p")
++    assert err.value.summary == "groq: not configured"

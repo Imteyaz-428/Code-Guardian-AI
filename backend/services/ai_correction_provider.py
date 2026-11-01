@@ -35,7 +35,10 @@ FORMAT_REMINDER = (
     "<explanation>\n(one or two sentences)\n</explanation>"
 )
 
-MAX_FORMAT_ATTEMPTS = 3
+# Each provider gets one format retry (with a reminder); after that it is skipped
+# and the next provider in the chain is tried.
+FORMAT_ATTEMPTS_PER_PROVIDER = 2
+MAX_FORMAT_ATTEMPTS = 6
 
 _TAG_CODE = re.compile(r"<corrected_code>(.*?)(?:</corrected_code>|<explanation>|\Z)", re.DOTALL | re.IGNORECASE)
 _TAG_EXPL = re.compile(r"<explanation>(.*?)(?:</explanation>|\Z)", re.DOTALL | re.IGNORECASE)
@@ -151,20 +154,38 @@ class FallbackCorrectionProvider:
         )
 
         last_error: Exception | None = None
-        for attempt in range(1, MAX_FORMAT_ATTEMPTS + 1):
-            try:
-                raw, provider = ai_service.generate_with_info(
-                    prompt + (FORMAT_REMINDER if attempt > 1 else ""), system_prompt=SYSTEM_PROMPT)
-            except AIProviderError as exc:
-                # provider error details must not leak into the API response
-                raise RuntimeError("All AI providers failed to generate a correction.") from exc
+        format_failures: dict[str, int] = {}
+        skip: set[str] = set()
+        attempts_made = 0
 
+        while attempts_made < MAX_FORMAT_ATTEMPTS:
+            full_prompt = prompt + (FORMAT_REMINDER if last_error else "")
+            try:
+                if skip:
+                    raw, provider = ai_service.generate_with_info(
+                        full_prompt, system_prompt=SYSTEM_PROMPT, skip=skip)
+                else:
+                    raw, provider = ai_service.generate_with_info(
+                        full_prompt, system_prompt=SYSTEM_PROMPT)
+            except AIProviderError as exc:
+                if last_error is not None:
+                    # some provider answered but with unusable output, and nobody is left
+                    break
+                # Only provider names + failure categories (no raw messages/keys) go out.
+                detail = exc.summary
+                message = "All AI providers failed to generate a correction."
+                raise RuntimeError(f"{message} ({detail})" if detail else message) from exc
+
+            attempts_made += 1
             try:
                 return parse_correction(raw)
             except CorrectionFormatError as exc:
                 last_error = exc
+                format_failures[provider] = format_failures.get(provider, 0) + 1
+                if format_failures[provider] >= FORMAT_ATTEMPTS_PER_PROVIDER:
+                    skip.add(provider)
                 logger.warning("Correction format problem from %s (attempt %d/%d): %s | reply starts: %r",
-                               provider, attempt, MAX_FORMAT_ATTEMPTS, exc, raw[:160])
+                               provider, attempts_made, MAX_FORMAT_ATTEMPTS, exc, raw[:160])
 
         raise RuntimeError(f"The AI did not return usable corrected code after "
-                           f"{MAX_FORMAT_ATTEMPTS} attempts ({last_error}).")
+                           f"{attempts_made} attempts ({last_error}).")

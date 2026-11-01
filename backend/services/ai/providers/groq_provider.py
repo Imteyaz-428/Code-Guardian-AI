@@ -3,6 +3,7 @@ from typing import Iterator, Optional
 
 from dotenv import load_dotenv
 
+from ..config import AI_REQUEST_TIMEOUT
 from .base_provider import BaseProvider, build_messages
 
 load_dotenv()
@@ -18,7 +19,7 @@ class GroqProvider(BaseProvider):
 
         from groq import Groq
 
-        self.client = Groq(api_key=api_key)
+        self.client = Groq(api_key=api_key, timeout=AI_REQUEST_TIMEOUT, max_retries=0)
         self.model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:

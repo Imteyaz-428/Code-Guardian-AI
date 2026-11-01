@@ -32,16 +32,32 @@ class RepositoryManager:
     def validate_repository(self) -> bool:
         return self.repository_path.is_dir()
 
-    def get_python_files(self) -> list[Path]:
+   
+    def get_python_files(
+        self,
+        include_tests: bool = True,
+    ) -> list[Path]:
         if not self.validate_repository():
-            raise ValueError(f"Invalid repository path: {self.repository_path}")
+            raise ValueError(
+                f"Invalid repository path: {self.repository_path}"
+            )
 
         files: list[Path] = []
         for path in self.repository_path.rglob("*.py"):
             if not path.is_file():
                 continue
-            if "__pycache__" in path.parts:
+
+            relative_path = path.relative_to(self.repository_path)
+
+            if "__pycache__" in relative_path.parts:
                 continue
+
+            if not include_tests and any(
+                part.lower() in {"test", "tests"}
+                for part in relative_path.parts[:-1]
+            ):
+                continue
+
             files.append(path)
 
         return sorted(files)

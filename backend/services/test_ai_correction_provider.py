@@ -35,7 +35,7 @@ def test_retries_with_format_reminder_then_succeeds(monkeypatch):
     seen = []
 
     class Fake:
-        def generate_with_info(self, prompt, system_prompt=None):
+        def generate_with_info(self, prompt, system_prompt=None, skip=None):
             seen.append(prompt)
             return next(replies), "stub"
 
@@ -47,9 +47,46 @@ def test_retries_with_format_reminder_then_succeeds(monkeypatch):
 
 def test_gives_up_after_max_attempts(monkeypatch):
     class Fake:
-        def generate_with_info(self, prompt, system_prompt=None):
+        def generate_with_info(self, prompt, system_prompt=None, skip=None):
+            if "stub" in (skip or ()):
+                raise m.AIProviderError("none left")
             return "no code here", "stub"
 
     monkeypatch.setattr(m, "ai_service", Fake())
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    with pytest.raises(RuntimeError, match="usable corrected code after 2 attempts"):
         m.FallbackCorrectionProvider().generate_correction(REQ)
+
+
+def test_unusable_output_falls_back_to_next_provider(monkeypatch):
+    calls = []
+
+    class Fake:
+        def generate_with_info(self, prompt, system_prompt=None, skip=None):
+            skip = skip or set()
+            calls.append(set(skip))
+            if "first" not in skip:
+                return "I would use a parameterised query.", "first"
+            return f"<corrected_code>\n{FUNC}\n</corrected_code>", "second"
+
+    monkeypatch.setattr(m, "ai_service", Fake())
+    out = m.FallbackCorrectionProvider().generate_correction(REQ)
+    assert out.corrected_code.startswith("def search")
+    assert calls == [set(), set(), {"first"}]
+
+
+def test_provider_failure_reports_which_provider_and_why(monkeypatch):
+    class Fake:
+        def generate_with_info(self, prompt, system_prompt=None, skip=None):
+            raise m.AIProviderError("raw: key=AIzaSECRETSECRETSECRETSECRET", attempts=[
+                {"provider": "gemini", "category": "quota or rate limit", "retryable": False, "status": 429},
+                {"provider": "deepseek", "category": "billing or credits exhausted", "retryable": False, "status": 402},
+            ])
+
+    monkeypatch.setattr(m, "ai_service", Fake())
+    with pytest.raises(RuntimeError) as err:
+        m.FallbackCorrectionProvider().generate_correction(REQ)
+    msg = str(err.value)
+    assert msg.startswith("All AI providers failed to generate a correction.")
+    assert "gemini: quota or rate limit (HTTP 429)" in msg
+    assert "deepseek: billing or credits exhausted (HTTP 402)" in msg
+    assert "AIza" not in msg

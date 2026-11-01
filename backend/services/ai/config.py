@@ -8,3 +8,6 @@ AI_PROVIDERS = settings.AI_PROVIDERS
 
 AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
 AI_RETRY_DELAY = float(os.getenv("AI_RETRY_DELAY", "1.5"))
+
+# Hard cap per provider call so one hung provider cannot block the fallback chain.
+AI_REQUEST_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "30"))

@@ -41,6 +41,16 @@ def module_name(rel: Path) -> str:
 def _ignore(_d: str, names: list[str]) -> set[str]:
     return {n for n in names if n in IGNORED}
 
+def _test_targets(workspace: Path) -> list[str]:
+    targets = []
+    tests = workspace / "tests"
+    if tests.is_dir() and (any(tests.rglob("test_*.py")) or any(tests.rglob("*_test.py"))):
+        targets.append("tests")
+    for p in sorted(workspace.glob("*.py")):
+        if p.name.startswith("test_") or p.name.endswith("_test.py"):
+            targets.append(p.name)
+    return targets
+
 
 class SandboxVerificationService:
     """verified = syntax OK + no test regressions in a Docker sandbox
@@ -48,10 +58,10 @@ class SandboxVerificationService:
     security findings in a static re-scan."""
 
     def _checks(self, runner, workspace: Path, rel: Path, timeout: int) -> dict:
-        tests = workspace / "tests"
-        if tests.is_dir() and (any(tests.rglob("test_*.py")) or any(tests.rglob("*_test.py"))):
+        targets = _test_targets(workspace)
+        if targets:
             run = runner.run(workspace, ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                                         "--tb=short", "-rfE", "tests"], timeout)
+                                         "--tb=short", "-rfE", *targets], timeout)
             return {"level": "tests", "run": run, "failures": parse_failures(run.stdout),
                     "ran": bool(_SUMMARY.search(run.stdout)),
                     "no_pytest": "No module named pytest" in run.stdout + run.stderr}
@@ -106,7 +116,7 @@ class SandboxVerificationService:
             if new["no_pytest"] or not new["ran"]:
                 return out("syntax_passed", "pytest did not run in the sandbox image. "
                            "Patch is NOT verified.", level, sb, run)
-            regressions = sorted(new["failures"] - base["failures"])
+            regressions = sorted(new["failures"])
             if regressions:
                 return out("rejected", f"Patch breaks {len(regressions)} test(s) that passed before.",
                            level, sb, run, regressions=regressions)
@@ -135,7 +145,29 @@ class SandboxVerificationService:
             return out("rejected", f"The {rule_id} finding is still detected after the patch.",
                        level, sb, run, security=sec)
 
-        mode = "Docker sandbox" if sb == "docker" else "LOCAL DEV MODE (not isolated)"
-        what = "original tests still pass" if level == "tests" else "module imports (no tests/ folder)"
-        return out("verified", f"Verified in {mode}: {what}; no new security findings.",
-                   level, sb, run, security=sec)
+       
+        if level != "tests":
+            return out(
+                "syntax_passed",
+                "Syntax and import smoke check passed, and no new "
+                "security findings were detected. No tests were run; "
+                "the patch is NOT verified.",
+                level,
+                sb,
+                run,
+                security=sec,
+            )
+
+        mode = (
+            "Docker sandbox"
+            if sb == "docker"
+            else "LOCAL DEV MODE (not isolated)"
+        )
+        return out(
+            "verified",
+            f"Verified in {mode}: tests passed; no new security findings.",
+            level,
+            sb,
+            run,
+            security=sec,
+        )

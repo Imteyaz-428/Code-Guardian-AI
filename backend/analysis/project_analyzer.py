@@ -248,7 +248,7 @@ class ProjectAnalyzer:
         # =====================================================
 
         for file_path in (
-            self.repository_manager.get_python_files()
+            self.repository_manager.get_python_files(include_tests=False)
         ):
 
             try:
@@ -1014,7 +1014,7 @@ class ProjectAnalyzer:
 
         summary = {
             "files": len(
-                self.repository_manager.get_python_files()
+                self.repository_manager.get_python_files(include_tests=False)
             ),
             "functions": len(
                 self.functions

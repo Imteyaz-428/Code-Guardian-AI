@@ -13,7 +13,8 @@ class Settings:
 
     def __init__(self) -> None:
         # Load environment variables from the project root .env file.
-        load_dotenv(self.PROJECT_ROOT / ".env")
+        load_dotenv(self.PROJECT_ROOT / ".env", override=True)
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
         # Repository analysis configuration
         self.ALLOWED_ANALYSIS_ROOT = self._get_analysis_root()
